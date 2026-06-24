@@ -113,6 +113,25 @@ async def create_workflow(client: httpx.AsyncClient, csrf: str) -> str:
     return str(resp.json()["id"])
 
 
+async def probe_gitlab_auth(*, deep: bool = False) -> dict:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=HTTP_TIMEOUT_SECONDS) as client:
+        csrf = await fetch_csrf_token(client)
+        workflow_checked = False
+        if deep:
+            await create_workflow(client, csrf)
+            workflow_checked = True
+        return {
+            "ok": True,
+            "gitlab_authenticated": True,
+            "namespace_id": _get_namespace_id(),
+            "checks": {
+                "csrf_token": bool(csrf),
+                "workflow": workflow_checked if deep else None,
+            },
+            "message": "GitLab authentication is valid.",
+        }
+
+
 def _ws_url(workflow_id: str, model: str) -> str:
     namespace_id = _get_namespace_id()
     return (

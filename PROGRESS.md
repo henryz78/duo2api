@@ -26,6 +26,7 @@
 - ✅ 未知模型 ID 返回 `model_not_found`，不再透传上游
 - ✅ 上游 HTTP / WebSocket / 响应等待超时保护
 - ✅ `/healthz` 健康检查
+- ✅ `/v1/gitlab/health?deep=true` 主动检测 GitLab Cookie 与 Duo workflow
 - ✅ 上游错误对客户端脱敏，详细信息写服务端日志
 - 🚧 工具调用（function calling）尚未实现
 - 🚧 联网搜索内置提示词尚未实现
@@ -399,6 +400,28 @@ curl http://localhost:8000/healthz
 ```json
 {"ok":true,"service":"duo2api"}
 ```
+
+验证 GitLab Cookie 主动检测：
+
+```bash
+curl "http://localhost:8000/v1/gitlab/health?deep=true" \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+期望肉眼结果：
+
+```json
+{
+  "ok": true,
+  "gitlab_authenticated": true,
+  "checks": {
+    "csrf_token": true,
+    "workflow": true
+  }
+}
+```
+
+如果 Cookie 失效，期望 `ok=false`，`message` 是脱敏后的提示，不包含 Cookie、GitLab 原始 HTML 或内部 API 响应全文。
 
 验证遮罩值保护：
 

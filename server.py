@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from context import build_prompt, is_known_model
-from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config
+from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, probe_gitlab_auth
 from security import (
     apply_config_update,
     auth_keys_from_config,
@@ -144,6 +144,8 @@ async def index():
   textarea {{ resize: vertical; min-height: 60px; }}
   .btn {{ display: inline-block; background: #6366f1; color: #fff; border: none; border-radius: 8px; padding: 0.65rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background 0.2s; margin-top: 1.25rem; }}
   .btn:hover {{ background: #4f46e5; }}
+  .btn.secondary {{ background: #334155; margin-left: 0.5rem; }}
+  .btn.secondary:hover {{ background: #475569; }}
   .hint {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; font-size: 0.82rem; color: #94a3b8; line-height: 1.7; }}
   .hint code {{ background: #1e293b; padding: 0.1em 0.4em; border-radius: 4px; color: #a5b4fc; font-size: 0.85em; }}
   .api-info {{ background: #0f172a; border-radius: 8px; padding: 1rem; font-size: 0.82rem; color: #94a3b8; }}
@@ -205,6 +207,7 @@ async def index():
       <textarea id="api_keys" placeholder="留空则保持不变；输入新 key 列表会覆盖当前配置"></textarea>
 
       <button type="submit" class="btn">保存配置</button>
+      <button type="button" id="checkGitLabBtn" class="btn secondary">检查 GitLab Cookie</button>
     </form>
     <div id="msg"></div>
   </div>
@@ -279,6 +282,27 @@ document.getElementById('admin_key').addEventListener('change', () => {{
   loadConfigStatus().catch(() => {{}});
 }});
 
+document.getElementById('checkGitLabBtn').addEventListener('click', async () => {{
+  const msg = document.getElementById('msg');
+  msg.style.display = 'block';
+  msg.className = 'success';
+  msg.textContent = '正在检查 GitLab Cookie...';
+  try {{
+    const res = await fetch('/v1/gitlab/health?deep=true', {{headers: authHeaders(false)}});
+    const json = await res.json();
+    if (res.ok && json.ok) {{
+      msg.className = 'success';
+      msg.textContent = '✅ GitLab Cookie 有效，Duo workflow 可创建';
+    }} else {{
+      msg.className = 'error';
+      msg.textContent = '❌ ' + (json.message || json.error?.message || 'GitLab Cookie 检查失败');
+    }}
+  }} catch(err) {{
+    msg.className = 'error';
+    msg.textContent = '❌ 网络错误：' + err.message;
+  }}
+}});
+
 document.getElementById('configForm').addEventListener('submit', async (e) => {{
   e.preventDefault();
   const msg = document.getElementById('msg');
@@ -344,6 +368,26 @@ async def list_models(request: Request):
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "service": "duo2api"}
+
+
+@app.get("/v1/gitlab/health")
+async def gitlab_health(request: Request, deep: bool = False):
+    if err := _check_auth(request, require_configured_keys=True):
+        return err
+    try:
+        return await probe_gitlab_auth(deep=deep)
+    except Exception as e:
+        logger.warning("GitLab Duo health check failed: %s", e)
+        return {
+            "ok": False,
+            "gitlab_authenticated": False,
+            "namespace_id": _load_config().get("gitlab", {}).get("namespace_id", ""),
+            "checks": {
+                "csrf_token": False,
+                "workflow": False if deep else None,
+            },
+            "message": public_upstream_error_message(e),
+        }
 
 
 @app.get("/v1/config")

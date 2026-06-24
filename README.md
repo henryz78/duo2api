@@ -123,6 +123,15 @@ curl http://localhost:8000/v1/models \
   -H "Authorization: Bearer sk-your-custom-key"
 ```
 
+### GET /v1/gitlab/health
+
+```bash
+curl "http://localhost:8000/v1/gitlab/health?deep=true" \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+`deep=true` 会验证 GitLab Cookie 能获取 CSRF，并创建一次 Duo workflow 来确认 namespace 权限。
+
 ### POST /v1/chat/completions
 
 **非流式：**
@@ -240,6 +249,7 @@ for chunk in client.chat.completions.create(
 ### 7. 生产安全与可靠性
 
 - `/healthz` 提供健康检查。
+- `/v1/gitlab/health?deep=true` 提供带鉴权的 GitLab Cookie 与 Duo workflow 主动检测。
 - GitLab HTTP 请求、WebSocket 握手和回复等待都设置了超时，避免上游卡住时长期占用连接。
 - 上游详细错误写入服务端日志，客户端只收到脱敏后的 OpenAI 风格错误。
 - token 粗估改为按 UTF-8 字节计算，对中文上下文更接近真实消耗。
