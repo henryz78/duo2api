@@ -15,7 +15,7 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
   │
   └─ WSS  /api/v4/ai/duo_workflows/ws          建立 WebSocket 连接
        │
-       ├─→ startRequest { goal, checkpoint, ... }   发送消息（含上轮 checkpoint 以保留历史）
+       ├─→ startRequest { goal, ... }               发送本次完整 prompt
        │
        └─← newCheckpoint { status, checkpoint }     流式接收回复
               │
@@ -28,8 +28,8 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 
 | OpenAI 概念 | GitLab Duo 实现 |
 |---|---|
-| 对话历史 | `checkpoint` JSON（GitLab 服务端维护） |
-| system message | 拼接为 `[System]\n...\n[User]\n...` |
+| 对话历史 | 每次请求完整拼接 OpenAI `messages` |
+| system/user/assistant/tool message | 拼接为带角色标签的 prompt |
 | stream=true | 逐 chunk 转发 SSE |
 | stream=false | 等待 `INPUT_REQUIRED` 后一次性返回 |
 | Bearer API Key | 本地校验，不透传给 GitLab |
@@ -195,8 +195,8 @@ for chunk in client.chat.completions.create(
 ## 注意事项
 
 - **Cookie 有效期**：`remember_user_token` 通常有效期约 2 周，过期后需重新获取。
-- **单用户设计**：服务内部维护单个对话 session，多并发请求会共享同一上下文。如需多用户隔离，需自行扩展 session 管理。
-- **对话历史**：历史由 GitLab 服务端通过 `checkpoint` 维护，重启服务后历史清空。
+- **对话历史**：服务每次使用客户端发来的完整 `messages` 作为上下文，不在服务端共享聊天历史。
+- **并发隔离**：每个请求创建独立 GitLab Duo workflow，不同客户端窗口不会通过服务端 session 串台。
 - **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`claude_opus_4_8` 需要 GitLab Duo Pro 权限，但目前用户可试用30天。
 
 ---
@@ -222,6 +222,10 @@ for chunk in client.chat.completions.create(
 
 每次请求时重新读取 `config.json`，修改配置文件后立即生效，无需重启进程。
 
-### 5. 每模型独立 session
+### 5. OpenAI messages 主历史
 
-每个模型维护独立的 DuoChat session，避免跨模型的对话历史污染。
+请求会把 `system`、`user`、`assistant`、`tool` 等 OpenAI messages 完整拼成 prompt。上下文由客户端会话历史决定，同一窗口换模型也能继续使用客户端传来的历史。
+
+### 6. 每请求独立 GitLab Duo workflow
+
+服务端不复用 GitLab checkpoint 作为主历史，避免不同客户端窗口或并发请求共享上下文。

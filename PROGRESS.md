@@ -19,6 +19,8 @@
 - ✅ 流式输出（SSE）和非流式均可用
 - ✅ API Key 鉴权（`Authorization: Bearer <key>`）
 - ✅ 配置文件热加载（修改 config.json 无需重启）
+- ✅ OpenAI `messages` 完整历史拼接
+- ✅ 每请求独立 GitLab Duo workflow，避免跨窗口/并发串台
 - 🚧 工具调用（function calling）尚未实现
 - 🚧 联网搜索内置提示词尚未实现
 
@@ -121,7 +123,7 @@ GitLab Duo 的 WebSocket 握手流程：
 3. 发送订阅消息 + 用户消息
 4. 解析 `ChunkAck` / `FinalAck` 收流
 
-每个 `DuoChat` 实例只初始化一次 workflow_id，之后复用。
+当前服务为每个 OpenAI 请求创建独立 `DuoChat` workflow。上下文来自客户端传入的完整 `messages`，避免服务端 checkpoint 在不同客户端窗口之间串台。
 
 ---
 
@@ -193,10 +195,139 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [ ] **工具调用（function calling）**：解析 OpenAI tools 格式，转换为 system prompt 注入到 Duo Chat
 - [ ] **联网搜索内置提示词**：system prompt 里注入搜索指令，让模型知道何时触发搜索
 - [ ] **Web 配置界面**：浏览器里直接修改 config.json（更新 Cookie、切换模型等）
-- [ ] **多 session 并发**：每个请求用独立 DuoChat 实例，支持并行对话
-- [ ] **对话历史**：把 messages 数组拼成多轮对话传给 Duo（目前只传最后一条）
+- [x] **多 session 并发**：每个请求用独立 DuoChat 实例，支持并行对话
+- [x] **对话历史**：把 messages 数组拼成多轮对话传给 Duo
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
 - [ ] **Docker 部署**：提供 Dockerfile，方便自托管
+
+---
+
+## 临时测试说明：上下文修复验证
+
+本节用于云端 agent 验证 2026-06-24 的上下文修复。验证目标：服务端不再共享 GitLab checkpoint 作为聊天历史；每个请求使用客户端传来的完整 OpenAI `messages`；同一个客户端窗口切换模型后，只要客户端继续发送历史 messages，模型能看到前文；不同窗口或并发请求不会通过服务端 session 串台。
+
+### 1. 本地自动测试
+
+在仓库根目录运行：
+
+```bash
+python -m unittest test_context.py
+python -m py_compile context.py server.py gitlab_duo_client.py test_context.py
+```
+
+期望结果：
+
+```text
+Ran 3 tests
+OK
+```
+
+`py_compile` 命令应以退出码 `0` 结束，无语法错误输出。
+
+### 2. 启动服务
+
+确认 `config.json` 已填入有效字段：
+
+- `gitlab.namespace_id`
+- `gitlab.cookies._gitlab_session`
+- `gitlab.cookies.remember_user_token`
+- `server.api_keys`
+
+启动：
+
+```bash
+python server.py
+```
+
+或：
+
+```bash
+uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+### 3. 验证完整 messages 历史
+
+发送一段显式多轮历史：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [
+      {"role": "system", "content": "你必须记住暗号是 blue-mango。"},
+      {"role": "user", "content": "我的暗号是什么？"},
+      {"role": "assistant", "content": "你的暗号是 blue-mango。"},
+      {"role": "user", "content": "只回答暗号本身。"}
+    ]
+  }'
+```
+
+期望肉眼结果：返回内容包含 `blue-mango`。这说明代理把前面的 system/user/assistant 历史一起传给了 GitLab Duo。
+
+### 4. 验证同窗口切模型继续上下文
+
+用同一段历史，把 `model` 换成另一个可用模型，例如：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-codex",
+    "messages": [
+      {"role": "system", "content": "你必须记住暗号是 blue-mango。"},
+      {"role": "user", "content": "我的暗号是什么？"},
+      {"role": "assistant", "content": "你的暗号是 blue-mango。"},
+      {"role": "user", "content": "只回答暗号本身。"}
+    ]
+  }'
+```
+
+期望肉眼结果：如果该模型在账号权限内可用，返回内容仍然包含 `blue-mango`。这说明上下文来自客户端 `messages`，不是来自某个模型自己的服务端 checkpoint。
+
+### 5. 验证不同窗口不串台
+
+模拟窗口 A：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [
+      {"role": "system", "content": "只记住窗口 A 的暗号 alpha-ctx。"},
+      {"role": "user", "content": "只回答当前暗号。"}
+    ]
+  }'
+```
+
+模拟窗口 B：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [
+      {"role": "system", "content": "只记住窗口 B 的暗号 beta-ctx。"},
+      {"role": "user", "content": "只回答当前暗号。"}
+    ]
+  }'
+```
+
+期望肉眼结果：窗口 A 返回 `alpha-ctx`，窗口 B 返回 `beta-ctx`。窗口 B 的回答不应出现 `alpha-ctx`。
+
+### 6. 验证服务重启后上下文恢复范围
+
+重启服务后，重新发送第 3 步的完整 `messages` 请求。
+
+期望肉眼结果：返回内容仍然能依据请求里的历史回答 `blue-mango`。这说明服务端重启不会影响客户端本次发来的可见历史。
+
+注意：如果客户端本身只发送最近几条 messages，代理只能传递这几条。客户端已经裁剪掉的旧消息，代理无法恢复。
 
 ---
 

@@ -5,12 +5,14 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from context import build_prompt
 from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, resolve_gitlab_model_id
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -23,19 +25,8 @@ SERVER_PORT: int = int(os.environ.get("PORT", _srv.get("port", 8000)))
 app = FastAPI(title="GitLab Duo OpenAI Proxy", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# One DuoChat session per model so history doesn't bleed across models
-_sessions: dict[str, DuoChat] = {}
-
-
-def _get_session(model: str) -> DuoChat:
-    if model not in _sessions:
-        _sessions[model] = DuoChat()
-    return _sessions[model]
-
-
 def _reset_sessions():
-    global _sessions
-    _sessions = {}
+    return None
 
 
 def _openai_error(status: int, code: str, message: str, param=None) -> JSONResponse:
@@ -62,7 +53,10 @@ def _check_auth(request: Request) -> JSONResponse | None:
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: str | list[dict[str, Any]] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -79,13 +73,7 @@ class ChatRequest(BaseModel):
 
 
 def _build_prompt(messages: list[Message]) -> str:
-    system_parts = [m.content for m in messages if m.role == "system"]
-    user_content = next((m.content for m in reversed(messages) if m.role == "user"), "")
-    if not user_content:
-        raise ValueError("No user message found in request.")
-    if system_parts:
-        return f"[System]\n{chr(10).join(system_parts)}\n\n[User]\n{user_content}"
-    return user_content
+    return build_prompt([m.model_dump(exclude_none=True) for m in messages])
 
 
 def _estimate_tokens(text: str) -> int:
@@ -358,7 +346,6 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     cfg = _load_config()
     model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
-
     prompt_tokens = _estimate_tokens(prompt)
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
 
@@ -373,12 +360,14 @@ async def chat_completions(request: Request, body: ChatRequest):
 
 
 async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str):
-    session = _get_session(model)
+    session = DuoChat()
     try:
         full = await session.send(prompt, model=model)
     except Exception as e:
         session.reset()
         return _openai_error(502, "upstream_error", str(e))
+    finally:
+        await session.close()
 
     completion_tokens = _estimate_tokens(full)
     return JSONResponse(content={
@@ -392,7 +381,7 @@ async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str)
 
 
 async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
-    session = _get_session(model)
+    session = DuoChat()
 
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
                 "model": model,
@@ -408,6 +397,8 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
         yield _sse({"error": {"message": str(e), "type": "server_error", "code": "upstream_error"}})
         yield "data: [DONE]\n\n"
         return
+    finally:
+        await session.close()
 
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
                 "model": model,
