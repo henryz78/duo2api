@@ -1,0 +1,422 @@
+"""OpenAI-compatible API wrapper for GitLab Duo Chat."""
+
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
+
+from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, resolve_gitlab_model_id
+
+CONFIG_PATH = Path(__file__).parent / "config.json"
+
+_cfg = _load_config()
+_srv = _cfg["server"]
+SERVER_HOST: str = _srv.get("host", "0.0.0.0")
+SERVER_PORT: int = int(os.environ.get("PORT", _srv.get("port", 8000)))
+
+app = FastAPI(title="GitLab Duo OpenAI Proxy", docs_url=None, redoc_url=None)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# One DuoChat session per model so history doesn't bleed across models
+_sessions: dict[str, DuoChat] = {}
+
+
+def _get_session(model: str) -> DuoChat:
+    if model not in _sessions:
+        _sessions[model] = DuoChat()
+    return _sessions[model]
+
+
+def _reset_sessions():
+    global _sessions
+    _sessions = {}
+
+
+def _openai_error(status: int, code: str, message: str, param=None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message,
+                           "type": "invalid_request_error" if status < 500 else "server_error",
+                           "param": param, "code": code}},
+    )
+
+
+def _check_auth(request: Request) -> JSONResponse | None:
+    cfg = _load_config()
+    keys = set(cfg["server"].get("api_keys", []))
+    if not keys:
+        return None
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return _openai_error(401, "invalid_api_key", "Missing or invalid Authorization header.")
+    if auth[len("Bearer "):] not in keys:
+        return _openai_error(401, "invalid_api_key", "Incorrect API key provided.")
+    return None
+
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    model: str = "claude-sonnet-4.5"
+    messages: list[Message]
+    stream: bool = False
+    temperature: float | None = None
+    max_tokens: int | None = None
+    top_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    stop: list[str] | str | None = None
+    user: str | None = None
+
+
+def _build_prompt(messages: list[Message]) -> str:
+    system_parts = [m.content for m in messages if m.role == "system"]
+    user_content = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    if not user_content:
+        raise ValueError("No user message found in request.")
+    if system_parts:
+        return f"[System]\n{chr(10).join(system_parts)}\n\n[User]\n{user_content}"
+    return user_content
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+def _chunk(req_id: str, model: str, content: str = "", finish_reason: str | None = None) -> str:
+    delta = {"content": content} if content else {}
+    return _sse({"id": req_id, "object": "chat.completion.chunk",
+                 "created": int(time.time()), "model": model,
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]})
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    cfg = _load_config()
+    gl = cfg["gitlab"]
+    srv = cfg["server"]
+    session_cookie = gl["cookies"].get("_gitlab_session", "")
+    remember_token = gl["cookies"].get("remember_user_token", "")
+    namespace_id = gl.get("namespace_id", "")
+    default_model = gl.get("model", "claude-sonnet-4.5")
+    api_keys = "\n".join(srv.get("api_keys", []))
+
+    configured = bool(session_cookie and session_cookie != "需填"
+                      and namespace_id and namespace_id != "需填")
+    status_color = "#22c55e" if configured else "#f59e0b"
+    status_text = "✅ 配置完成，服务运行中" if configured else "⚠️ 请填写 GitLab 配置"
+
+    model_options = "\n".join(
+        f'<option value="{m["id"]}" {"selected" if m["id"] == default_model else ""}>{m["name"]} ({m["owned_by"]})</option>'
+        for m in ALL_MODELS
+    )
+
+    model_table_rows = "\n".join(
+        f'<tr><td><code>{m["id"]}</code></td><td>{m["name"]}</td><td>{m["owned_by"].title()}</td></tr>'
+        for m in ALL_MODELS
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitLab Duo OpenAI Proxy</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 2rem 1rem; }}
+  .container {{ max-width: 760px; margin: 0 auto; }}
+  h1 {{ font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; color: #f8fafc; }}
+  .subtitle {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 2rem; }}
+  .status {{ background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; }}
+  .status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: {status_color}; flex-shrink: 0; }}
+  .status-text {{ font-size: 0.95rem; color: {status_color}; }}
+  .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
+  .card h2 {{ font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #cbd5e1; }}
+  label {{ display: block; font-size: 0.82rem; color: #94a3b8; margin-bottom: 0.4rem; margin-top: 1rem; }}
+  label:first-of-type {{ margin-top: 0; }}
+  input, textarea, select {{ width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 0.6rem 0.8rem; color: #e2e8f0; font-size: 0.88rem; font-family: 'Courier New', monospace; outline: none; transition: border-color 0.2s; }}
+  select {{ font-family: inherit; cursor: pointer; }}
+  input:focus, textarea:focus, select:focus {{ border-color: #6366f1; }}
+  textarea {{ resize: vertical; min-height: 60px; }}
+  .btn {{ display: inline-block; background: #6366f1; color: #fff; border: none; border-radius: 8px; padding: 0.65rem 1.5rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: background 0.2s; margin-top: 1.25rem; }}
+  .btn:hover {{ background: #4f46e5; }}
+  .hint {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; font-size: 0.82rem; color: #94a3b8; line-height: 1.7; }}
+  .hint code {{ background: #1e293b; padding: 0.1em 0.4em; border-radius: 4px; color: #a5b4fc; font-size: 0.85em; }}
+  .api-info {{ background: #0f172a; border-radius: 8px; padding: 1rem; font-size: 0.82rem; color: #94a3b8; }}
+  .api-info .row {{ display: flex; justify-content: space-between; padding: 0.4rem 0; border-bottom: 1px solid #1e293b; }}
+  .api-info .row:last-child {{ border-bottom: none; }}
+  .api-info .val {{ color: #a5b4fc; font-family: monospace; font-size: 0.85em; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+  th {{ text-align: left; color: #64748b; font-weight: 600; padding: 0.4rem 0.6rem; border-bottom: 1px solid #334155; }}
+  td {{ padding: 0.45rem 0.6rem; border-bottom: 1px solid #1e293b; color: #94a3b8; }}
+  td code {{ color: #a5b4fc; font-size: 0.85em; }}
+  tr:last-child td {{ border-bottom: none; }}
+  #msg {{ margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.88rem; display: none; }}
+  .success {{ background: #14532d; color: #86efac; }}
+  .error {{ background: #7f1d1d; color: #fca5a5; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🦊 GitLab Duo OpenAI Proxy</h1>
+  <p class="subtitle">将 GitLab Duo Chat 包装成 OpenAI 兼容 API</p>
+
+  <div class="status">
+    <div class="status-dot"></div>
+    <span class="status-text">{status_text}</span>
+  </div>
+
+  <div class="card">
+    <h2>接口信息</h2>
+    <div class="api-info">
+      <div class="row"><span>Base URL</span><span class="val">/v1</span></div>
+      <div class="row"><span>Chat Completions</span><span class="val">POST /v1/chat/completions</span></div>
+      <div class="row"><span>Models</span><span class="val">GET /v1/models</span></div>
+      <div class="row"><span>默认模型</span><span class="val">{default_model}</span></div>
+      <div class="row"><span>可用模型数</span><span class="val">{len(ALL_MODELS)} 个</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>GitLab 配置</h2>
+    <form id="configForm">
+      <label>_gitlab_session Cookie</label>
+      <input type="password" id="gitlab_session" value="{session_cookie}" placeholder="从浏览器开发者工具获取">
+
+      <label>remember_user_token Cookie（可选，有效期更长）</label>
+      <input type="password" id="remember_token" value="{remember_token}" placeholder="登录时勾选 Remember me 后才有">
+
+      <label>Namespace ID（需使用有 Duo 权限的 Group namespace）</label>
+      <input type="text" id="namespace_id" value="{namespace_id}" placeholder="例：135817766">
+
+      <label>默认模型（请求未指定时使用）</label>
+      <select id="model_input">
+        {model_options}
+      </select>
+
+      <label>API Keys（每行一个，留空则不鉴权）</label>
+      <textarea id="api_keys" placeholder="sk-your-key">{api_keys}</textarea>
+
+      <button type="submit" class="btn">保存配置</button>
+    </form>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>支持的全部模型（{len(ALL_MODELS)} 个）</h2>
+    <table>
+      <thead><tr><th>Model ID</th><th>名称</th><th>提供商</th></tr></thead>
+      <tbody>{model_table_rows}</tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>如何获取 GitLab Cookie</h2>
+    <div class="hint">
+      1. 浏览器登录 <code>gitlab.com</code>（登录时勾选 "Remember me"）<br>
+      2. 按 <code>F12</code> → Application → Cookies → gitlab.com<br>
+      3. 复制 <code>_gitlab_session</code> 和 <code>remember_user_token</code><br><br>
+      <strong>Namespace ID：</strong> 访问
+      <code>https://gitlab.com/api/v4/namespaces?search=你的用户名</code>，
+      找 <code>kind=group</code> 且有 Ultimate/Pro 的那个 <code>id</code>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>第三方客户端接入</h2>
+    <div class="hint">
+      在 <strong>ChatBox / Open WebUI / Cursor / Continue</strong> 设置中填写：<br><br>
+      API Base URL：<code>https://你的域名/v1</code><br>
+      API Key：配置的 key<br>
+      Model：任意上方表格中的 Model ID
+    </div>
+  </div>
+</div>
+
+<script>
+document.getElementById('configForm').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const msg = document.getElementById('msg');
+  const data = {{
+    gitlab_session: document.getElementById('gitlab_session').value,
+    remember_token: document.getElementById('remember_token').value,
+    namespace_id: document.getElementById('namespace_id').value,
+    model: document.getElementById('model_input').value,
+    api_keys: document.getElementById('api_keys').value.split('\\n').map(k => k.trim()).filter(Boolean)
+  }};
+  try {{
+    const res = await fetch('/v1/config', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(data)
+    }});
+    const json = await res.json();
+    msg.style.display = 'block';
+    if (res.ok) {{
+      msg.className = 'success';
+      msg.textContent = '✅ 配置已保存，所有会话已重置';
+      setTimeout(() => location.reload(), 1500);
+    }} else {{
+      msg.className = 'error';
+      msg.textContent = '❌ ' + (json.detail || '保存失败');
+    }}
+  }} catch(err) {{
+    msg.style.display = 'block';
+    msg.className = 'error';
+    msg.textContent = '❌ 网络错误：' + err.message;
+  }}
+}});
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# API Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    if err := _check_auth(request):
+        return err
+    ts = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {"id": m["id"], "object": "model", "created": ts,
+             "owned_by": m["owned_by"], "permission": [], "root": m["id"], "parent": None}
+            for m in ALL_MODELS
+        ],
+    }
+
+
+@app.get("/v1/config")
+async def get_config():
+    cfg = _load_config()
+    gl = cfg["gitlab"]
+    return {
+        "namespace_id": gl.get("namespace_id"),
+        "model": gl.get("model"),
+        "has_session_cookie": bool(gl["cookies"].get("_gitlab_session", "").strip()),
+        "has_remember_token": bool(gl["cookies"].get("remember_user_token", "").strip()),
+        "api_keys_count": len(cfg["server"].get("api_keys", [])),
+        "available_models": len(ALL_MODELS),
+    }
+
+
+class ConfigUpdate(BaseModel):
+    gitlab_session: str
+    remember_token: str
+    namespace_id: str
+    model: str = "claude-sonnet-4.5"
+    api_keys: list[str] = []
+
+
+@app.post("/v1/config")
+async def update_config(body: ConfigUpdate):
+    cfg = _load_config()
+    cfg["gitlab"]["cookies"]["_gitlab_session"] = body.gitlab_session
+    cfg["gitlab"]["cookies"]["remember_user_token"] = body.remember_token
+    cfg["gitlab"]["namespace_id"] = body.namespace_id
+    cfg["gitlab"]["model"] = body.model
+    cfg["server"]["api_keys"] = body.api_keys
+
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    _reset_sessions()
+    return {"ok": True}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, body: ChatRequest):
+    if err := _check_auth(request):
+        return err
+
+    try:
+        prompt = _build_prompt(body.messages)
+    except ValueError as e:
+        return _openai_error(400, "invalid_request_error", str(e), param="messages")
+
+    cfg = _load_config()
+    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
+
+    prompt_tokens = _estimate_tokens(prompt)
+    req_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    if body.stream:
+        return StreamingResponse(
+            _do_stream(prompt, req_id, prompt_tokens, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    return await _do_complete(prompt, req_id, prompt_tokens, model)
+
+
+async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str):
+    session = _get_session(model)
+    try:
+        full = await session.send(prompt, model=model)
+    except Exception as e:
+        session.reset()
+        return _openai_error(502, "upstream_error", str(e))
+
+    completion_tokens = _estimate_tokens(full)
+    return JSONResponse(content={
+        "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": full},
+                     "finish_reason": "stop", "logprobs": None}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                  "total_tokens": prompt_tokens + completion_tokens},
+        "system_fingerprint": None,
+    })
+
+
+async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
+    session = _get_session(model)
+
+    yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+
+    completion_tokens = 0
+    try:
+        async for chunk in session.stream(prompt, model=model):
+            completion_tokens += _estimate_tokens(chunk)
+            yield _chunk(req_id, model, content=chunk)
+    except Exception as e:
+        session.reset()
+        yield _sse({"error": {"message": str(e), "type": "server_error", "code": "upstream_error"}})
+        yield "data: [DONE]\n\n"
+        return
+
+    yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                          "total_tokens": prompt_tokens + completion_tokens}})
+    yield "data: [DONE]\n\n"
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host=SERVER_HOST, port=SERVER_PORT, reload=False)
