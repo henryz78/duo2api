@@ -39,7 +39,8 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 ## 文件说明
 
 ```
-config.json            所有配置（cookies、api_keys、服务地址）
+config.example.json    配置模板
+config.json            本地运行配置（cookies、api_keys、服务地址，已被 gitignore）
 gitlab_duo_client.py   WebSocket 客户端核心逻辑
 server.py              FastAPI 服务，暴露 OpenAI 兼容接口
 ```
@@ -71,7 +72,11 @@ curl -s "https://gitlab.com/api/v4/namespaces?search=你的用户名" \
 ```
 响应中的有两个id字段，第二个就是
 
-### 4. 编辑 config.json
+### 4. 创建并编辑 config.json
+
+```bash
+cp config.example.json config.json
+```
 
 ```json
 {
@@ -95,7 +100,7 @@ curl -s "https://gitlab.com/api/v4/namespaces?search=你的用户名" \
 }
 ```
 
-`api_keys` 留空数组 `[]` 表示不鉴权（仅建议本地使用）。
+`config.json` 保存真实 Cookie 和 API Key，本仓库只提交 `config.example.json` 模板。`api_keys` 留空数组 `[]` 表示聊天接口不鉴权（仅建议本地使用），管理配置接口需要至少一个 API Key。
 
 ### 5. 启动服务
 

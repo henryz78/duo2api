@@ -56,10 +56,12 @@ pip install fastapi uvicorn httpx websockets
 ### 3. 上传 / 创建核心文件
 
 ```
-src/
-  gitlab_duo_client.py   # WebSocket 客户端 + 模型映射
-  gitlab2api_server.py   # FastAPI 路由
-config.json              # 凭据配置（见 config.example.json）
+gitlab_duo_client.py   # WebSocket 客户端 + 模型映射
+server.py              # FastAPI 路由
+context.py             # OpenAI messages 转 prompt
+security.py            # 鉴权、脱敏、配置保护 helper
+config.example.json    # 配置模板
+config.json            # 本地凭据配置（已被 gitignore）
 ```
 
 ### 4. 配置 Workflow
@@ -82,6 +84,10 @@ paths = ["/"]
 ### 5. 填写 config.json
 
 复制 `config.example.json` 为 `config.json`，填入：
+
+```bash
+cp config.example.json config.json
+```
 
 | 字段 | 说明 |
 |------|------|
@@ -226,7 +232,7 @@ python -m py_compile context.py security.py server.py gitlab_duo_client.py test_
 期望结果：
 
 ```text
-Ran 4 tests
+Ran 5 tests
 OK
 ```
 
@@ -415,11 +421,14 @@ curl -i http://localhost:8000/v1/config \
 
 ```
 .
-├── src/
-│   ├── gitlab_duo_client.py   # WebSocket 客户端核心逻辑
-│   └── gitlab2api_server.py   # FastAPI 入口
-├── config.json                # 运行时凭据（不提交到 git）
+├── context.py                 # OpenAI messages 转 prompt
+├── gitlab_duo_client.py       # WebSocket 客户端核心逻辑
+├── security.py                # 鉴权、脱敏、配置保护 helper
+├── server.py                  # FastAPI 入口
 ├── config.example.json        # 配置模板
+├── config.json                # 本地运行凭据（gitignore）
 ├── requirements.txt           # Python 依赖
+├── test_context.py            # 上下文测试
+├── test_security.py           # 安全测试
 └── PROGRESS.md                # 本文件
 ```
