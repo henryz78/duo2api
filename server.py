@@ -1,6 +1,7 @@
 """OpenAI-compatible API wrapper for GitLab Duo Chat."""
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -10,10 +11,18 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from context import build_prompt, is_known_model
-from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, resolve_gitlab_model_id
+from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config
+from security import (
+    apply_config_update,
+    auth_keys_from_config,
+    clear_auth_cache,
+    estimate_tokens,
+    public_config_status,
+    public_upstream_error_message,
+)
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -24,9 +33,7 @@ SERVER_PORT: int = int(os.environ.get("PORT", _srv.get("port", 8000)))
 
 app = FastAPI(title="GitLab Duo OpenAI Proxy", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-def _reset_sessions():
-    return None
+logger = logging.getLogger("duo2api")
 
 
 def _openai_error(status: int, code: str, message: str, param=None) -> JSONResponse:
@@ -38,9 +45,14 @@ def _openai_error(status: int, code: str, message: str, param=None) -> JSONRespo
     )
 
 
-def _check_auth(request: Request) -> JSONResponse | None:
-    cfg = _load_config()
-    keys = set(cfg["server"].get("api_keys", []))
+def _check_auth(request: Request, *, require_configured_keys: bool = False) -> JSONResponse | None:
+    keys = auth_keys_from_config(CONFIG_PATH)
+    if require_configured_keys and not keys:
+        return _openai_error(
+            403,
+            "config_auth_required",
+            "Configure server.api_keys in config.json before using config management endpoints.",
+        )
     if not keys:
         return None
     auth = request.headers.get("Authorization", "")
@@ -77,7 +89,7 @@ def _build_prompt(messages: list[Message]) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    return estimate_tokens(text)
 
 
 def _sse(payload: dict) -> str:
@@ -97,22 +109,8 @@ def _chunk(req_id: str, model: str, content: str = "", finish_reason: str | None
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    cfg = _load_config()
-    gl = cfg["gitlab"]
-    srv = cfg["server"]
-    session_cookie = gl["cookies"].get("_gitlab_session", "")
-    remember_token = gl["cookies"].get("remember_user_token", "")
-    namespace_id = gl.get("namespace_id", "")
-    default_model = gl.get("model", "claude-sonnet-4.5")
-    api_keys = "\n".join(srv.get("api_keys", []))
-
-    configured = bool(session_cookie and session_cookie != "需填"
-                      and namespace_id and namespace_id != "需填")
-    status_color = "#22c55e" if configured else "#f59e0b"
-    status_text = "✅ 配置完成，服务运行中" if configured else "⚠️ 请填写 GitLab 配置"
-
     model_options = "\n".join(
-        f'<option value="{m["id"]}" {"selected" if m["id"] == default_model else ""}>{m["name"]} ({m["owned_by"]})</option>'
+        f'<option value="{m["id"]}" {"selected" if m["id"] == "claude-sonnet-4.5" else ""}>{m["name"]} ({m["owned_by"]})</option>'
         for m in ALL_MODELS
     )
 
@@ -134,8 +132,8 @@ async def index():
   h1 {{ font-size: 1.6rem; font-weight: 700; margin-bottom: 0.25rem; color: #f8fafc; }}
   .subtitle {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 2rem; }}
   .status {{ background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 2rem; display: flex; align-items: center; gap: 0.75rem; }}
-  .status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: {status_color}; flex-shrink: 0; }}
-  .status-text {{ font-size: 0.95rem; color: {status_color}; }}
+  .status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: #f59e0b; flex-shrink: 0; }}
+  .status-text {{ font-size: 0.95rem; color: #f59e0b; }}
   .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }}
   .card h2 {{ font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #cbd5e1; }}
   label {{ display: block; font-size: 0.82rem; color: #94a3b8; margin-bottom: 0.4rem; margin-top: 1rem; }}
@@ -169,7 +167,7 @@ async def index():
 
   <div class="status">
     <div class="status-dot"></div>
-    <span class="status-text">{status_text}</span>
+    <span class="status-text">请输入管理 API Key 读取配置状态</span>
   </div>
 
   <div class="card">
@@ -178,7 +176,7 @@ async def index():
       <div class="row"><span>Base URL</span><span class="val">/v1</span></div>
       <div class="row"><span>Chat Completions</span><span class="val">POST /v1/chat/completions</span></div>
       <div class="row"><span>Models</span><span class="val">GET /v1/models</span></div>
-      <div class="row"><span>默认模型</span><span class="val">{default_model}</span></div>
+      <div class="row"><span>默认模型</span><span class="val" id="default_model_status">待读取</span></div>
       <div class="row"><span>可用模型数</span><span class="val">{len(ALL_MODELS)} 个</span></div>
     </div>
   </div>
@@ -186,22 +184,25 @@ async def index():
   <div class="card">
     <h2>GitLab 配置</h2>
     <form id="configForm">
+      <label>管理 API Key</label>
+      <input type="password" id="admin_key" value="" placeholder="用于读取和保存配置；不会写入页面源码">
+
       <label>_gitlab_session Cookie</label>
-      <input type="password" id="gitlab_session" value="{session_cookie}" placeholder="从浏览器开发者工具获取">
+      <input type="password" id="gitlab_session" value="" placeholder="留空则保持不变">
 
       <label>remember_user_token Cookie（可选，有效期更长）</label>
-      <input type="password" id="remember_token" value="{remember_token}" placeholder="登录时勾选 Remember me 后才有">
+      <input type="password" id="remember_token" value="" placeholder="留空则保持不变">
 
       <label>Namespace ID（需使用有 Duo 权限的 Group namespace）</label>
-      <input type="text" id="namespace_id" value="{namespace_id}" placeholder="例：135817766">
+      <input type="text" id="namespace_id" value="" placeholder="例：135817766">
 
       <label>默认模型（请求未指定时使用）</label>
       <select id="model_input">
         {model_options}
       </select>
 
-      <label>API Keys（每行一个，留空则不鉴权）</label>
-      <textarea id="api_keys" placeholder="sk-your-key">{api_keys}</textarea>
+      <label>API Keys（每行一个，留空则保持不变）</label>
+      <textarea id="api_keys" placeholder="留空则保持不变；输入新 key 列表会覆盖当前配置"></textarea>
 
       <button type="submit" class="btn">保存配置</button>
     </form>
@@ -240,9 +241,51 @@ async def index():
 </div>
 
 <script>
+let configLoaded = false;
+
+function authHeaders(includeJson = true) {{
+  const key = document.getElementById('admin_key').value.trim();
+  const headers = includeJson ? {{'Content-Type': 'application/json'}} : {{}};
+  if (key) headers['Authorization'] = 'Bearer ' + key;
+  return headers;
+}}
+
+async function loadConfigStatus() {{
+  const msg = document.getElementById('msg');
+  const res = await fetch('/v1/config', {{headers: authHeaders(false)}});
+  if (!res.ok) {{
+    configLoaded = false;
+    msg.style.display = 'block';
+    msg.className = 'error';
+    msg.textContent = '请输入有效管理 API Key 后保存或刷新配置状态';
+    return false;
+  }}
+  const cfg = await res.json();
+  document.getElementById('namespace_id').value = cfg.namespace_id || '';
+  document.getElementById('model_input').value = cfg.model || 'claude-sonnet-4.5';
+  document.getElementById('default_model_status').textContent = cfg.model || '未配置';
+  document.getElementById('gitlab_session').placeholder = cfg.has_session_cookie ? '已配置；留空则保持不变' : '未配置';
+  document.getElementById('remember_token').placeholder = cfg.has_remember_token ? '已配置；留空则保持不变' : '未配置';
+  document.getElementById('api_keys').placeholder = '已配置 ' + cfg.api_keys_count + ' 个；留空则保持不变；输入新 key 列表会覆盖当前配置';
+  msg.style.display = 'block';
+  msg.className = 'success';
+  msg.textContent = '配置状态已读取';
+  configLoaded = true;
+  return true;
+}}
+
+document.getElementById('admin_key').addEventListener('change', () => {{
+  configLoaded = false;
+  loadConfigStatus().catch(() => {{}});
+}});
+
 document.getElementById('configForm').addEventListener('submit', async (e) => {{
   e.preventDefault();
   const msg = document.getElementById('msg');
+  if (!configLoaded) {{
+    const loaded = await loadConfigStatus().catch(() => false);
+    if (!loaded) return;
+  }}
   const data = {{
     gitlab_session: document.getElementById('gitlab_session').value,
     remember_token: document.getElementById('remember_token').value,
@@ -253,18 +296,18 @@ document.getElementById('configForm').addEventListener('submit', async (e) => {{
   try {{
     const res = await fetch('/v1/config', {{
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
+      headers: authHeaders(true),
       body: JSON.stringify(data)
     }});
     const json = await res.json();
     msg.style.display = 'block';
     if (res.ok) {{
       msg.className = 'success';
-      msg.textContent = '✅ 配置已保存，所有会话已重置';
-      setTimeout(() => location.reload(), 1500);
+      msg.textContent = '✅ 配置已保存';
+      await loadConfigStatus();
     }} else {{
       msg.className = 'error';
-      msg.textContent = '❌ ' + (json.detail || '保存失败');
+      msg.textContent = '❌ ' + (json.error?.message || json.detail || '保存失败');
     }}
   }} catch(err) {{
     msg.style.display = 'block';
@@ -272,6 +315,8 @@ document.getElementById('configForm').addEventListener('submit', async (e) => {{
     msg.textContent = '❌ 网络错误：' + err.message;
   }}
 }});
+
+loadConfigStatus().catch(() => {{}});
 </script>
 </body>
 </html>"""
@@ -296,42 +341,56 @@ async def list_models(request: Request):
     }
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "service": "duo2api"}
+
+
 @app.get("/v1/config")
-async def get_config():
+async def get_config(request: Request):
+    if err := _check_auth(request, require_configured_keys=True):
+        return err
     cfg = _load_config()
-    gl = cfg["gitlab"]
-    return {
-        "namespace_id": gl.get("namespace_id"),
-        "model": gl.get("model"),
-        "has_session_cookie": bool(gl["cookies"].get("_gitlab_session", "").strip()),
-        "has_remember_token": bool(gl["cookies"].get("remember_user_token", "").strip()),
-        "api_keys_count": len(cfg["server"].get("api_keys", [])),
-        "available_models": len(ALL_MODELS),
-    }
+    return public_config_status(cfg, len(ALL_MODELS))
 
 
 class ConfigUpdate(BaseModel):
-    gitlab_session: str
-    remember_token: str
-    namespace_id: str
-    model: str = "claude-sonnet-4.5"
-    api_keys: list[str] = []
+    gitlab_session: str = ""
+    remember_token: str = ""
+    namespace_id: str | None = None
+    model: str | None = None
+    api_keys: list[str] = Field(default_factory=list)
 
 
 @app.post("/v1/config")
-async def update_config(body: ConfigUpdate):
+async def update_config(request: Request, body: ConfigUpdate):
+    if err := _check_auth(request, require_configured_keys=True):
+        return err
     cfg = _load_config()
-    cfg["gitlab"]["cookies"]["_gitlab_session"] = body.gitlab_session
-    cfg["gitlab"]["cookies"]["remember_user_token"] = body.remember_token
-    cfg["gitlab"]["namespace_id"] = body.namespace_id
-    cfg["gitlab"]["model"] = body.model
-    cfg["server"]["api_keys"] = body.api_keys
+    if body.model and not is_known_model(body.model, ALL_MODELS):
+        return _openai_error(
+            400,
+            "model_not_found",
+            f"Model '{body.model}' not found. Call /v1/models for available models.",
+            param="model",
+        )
+    try:
+        apply_config_update(
+            cfg,
+            gitlab_session=body.gitlab_session,
+            remember_token=body.remember_token,
+            namespace_id=body.namespace_id,
+            model=body.model,
+            api_keys=body.api_keys,
+        )
+    except ValueError as e:
+        return _openai_error(400, "invalid_request_error", str(e), param="config")
 
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    _reset_sessions()
-    return {"ok": True}
+    clear_auth_cache()
+    return {"ok": True, "message": "Config saved. Stateless mode uses new GitLab workflow per request."}
 
 
 @app.post("/v1/chat/completions")
@@ -371,8 +430,8 @@ async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str)
     try:
         full = await session.send(prompt, model=model)
     except Exception as e:
-        session.reset()
-        return _openai_error(502, "upstream_error", str(e))
+        logger.warning("GitLab Duo upstream error: %s", e)
+        return _openai_error(502, "upstream_error", public_upstream_error_message(e))
     finally:
         await session.close()
 
@@ -400,8 +459,8 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
             completion_tokens += _estimate_tokens(chunk)
             yield _chunk(req_id, model, content=chunk)
     except Exception as e:
-        session.reset()
-        yield _sse({"error": {"message": str(e), "type": "server_error", "code": "upstream_error"}})
+        logger.warning("GitLab Duo upstream stream error: %s", e)
+        yield _sse({"error": {"message": public_upstream_error_message(e), "type": "server_error", "code": "upstream_error"}})
         yield "data: [DONE]\n\n"
         return
     finally:

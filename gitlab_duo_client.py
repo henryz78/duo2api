@@ -36,6 +36,10 @@ def _get_ua() -> str:
 GITLAB_HOST = "https://gitlab.com"
 WSS_HOST = "wss://gitlab.com"
 MODEL = "claude-sonnet-4.5"
+HTTP_TIMEOUT_SECONDS = 30.0
+WS_OPEN_TIMEOUT_SECONDS = 10.0
+WS_CLOSE_TIMEOUT_SECONDS = 5.0
+RESPONSE_TIMEOUT_SECONDS = 120.0
 
 # id        = user-facing OpenAI-compatible model ID (dashes + dots)
 # gitlab_id = internal GitLab identifier sent in the WebSocket URL (snake_case)
@@ -212,7 +216,7 @@ class DuoChat:
 
     async def _ensure_init(self):
         if self._http is None:
-            self._http = httpx.AsyncClient(follow_redirects=True)
+            self._http = httpx.AsyncClient(follow_redirects=True, timeout=HTTP_TIMEOUT_SECONDS)
         if self._csrf is None:
             self._csrf = await fetch_csrf_token(self._http)
         if self.workflow_id is None:
@@ -228,11 +232,17 @@ class DuoChat:
             "User-Agent": ua,
         }
 
-        async with websockets.connect(_ws_url(self.workflow_id, use_model), additional_headers=ws_headers) as ws:
+        async with websockets.connect(
+            _ws_url(self.workflow_id, use_model),
+            additional_headers=ws_headers,
+            open_timeout=WS_OPEN_TIMEOUT_SECONDS,
+            close_timeout=WS_CLOSE_TIMEOUT_SECONDS,
+        ) as ws:
             payload = _start_msg(self.workflow_id, message, checkpoint=self.last_checkpoint)
             await ws.send(payload)
-            answer, self.last_checkpoint, self.last_agent_id = await _recv_until_done(
-                ws, workflow_id=self.workflow_id, seen_id=self.last_agent_id
+            answer, self.last_checkpoint, self.last_agent_id = await asyncio.wait_for(
+                _recv_until_done(ws, workflow_id=self.workflow_id, seen_id=self.last_agent_id),
+                timeout=RESPONSE_TIMEOUT_SECONDS,
             )
 
         return answer
@@ -252,32 +262,38 @@ class DuoChat:
         seen_id = self.last_agent_id
         printed_len = 0
 
-        async with websockets.connect(_ws_url(self.workflow_id, use_model), additional_headers=ws_headers) as ws:
+        async with websockets.connect(
+            _ws_url(self.workflow_id, use_model),
+            additional_headers=ws_headers,
+            open_timeout=WS_OPEN_TIMEOUT_SECONDS,
+            close_timeout=WS_CLOSE_TIMEOUT_SECONDS,
+        ) as ws:
             payload = _start_msg(self.workflow_id, message, checkpoint=last_checkpoint)
             await ws.send(payload)
 
-            async for raw in ws:
-                data = json.loads(raw)
-                if "newCheckpoint" not in data:
-                    if "error" in data:
-                        raise RuntimeError(f"Server error: {data['error']}")
-                    continue
+            async with asyncio.timeout(RESPONSE_TIMEOUT_SECONDS):
+                async for raw in ws:
+                    data = json.loads(raw)
+                    if "newCheckpoint" not in data:
+                        if "error" in data:
+                            raise RuntimeError(f"Server error: {data['error']}")
+                        continue
 
-                cp = data["newCheckpoint"]
-                status = cp.get("status", "")
-                last_checkpoint = cp.get("checkpoint", last_checkpoint)
+                    cp = data["newCheckpoint"]
+                    status = cp.get("status", "")
+                    last_checkpoint = cp.get("checkpoint", last_checkpoint)
 
-                content, mid = _extract_new_agent_content(last_checkpoint, seen_id)
-                if content and len(content) > printed_len:
-                    new_chunk = content[printed_len:]
-                    printed_len = len(content)
-                    current_id = mid
-                    yield new_chunk
+                    content, mid = _extract_new_agent_content(last_checkpoint, seen_id)
+                    if content and len(content) > printed_len:
+                        new_chunk = content[printed_len:]
+                        printed_len = len(content)
+                        current_id = mid
+                        yield new_chunk
 
-                if status in ("INPUT_REQUIRED", "COMPLETE"):
-                    break
-                elif status == "FAILED":
-                    raise RuntimeError(f"Workflow failed: {cp.get('errors', [])}")
+                    if status in ("INPUT_REQUIRED", "COMPLETE"):
+                        break
+                    elif status == "FAILED":
+                        raise RuntimeError(f"Workflow failed: {cp.get('errors', [])}")
 
         self.last_checkpoint = last_checkpoint
         self.last_agent_id = current_id

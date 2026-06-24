@@ -217,11 +217,12 @@ for chunk in client.chat.completions.create(
 
 ### 3. Web 配置界面
 
-访问服务根路径 `/` 可看到一个暗色主题的配置页面，支持在浏览器里直接修改 Cookie、namespace_id、默认模型和 API Keys，保存后无需重启。
+访问服务根路径 `/` 可看到一个暗色主题的配置页面。页面不会把 Cookie 或 API Key 渲染进 HTML 源码；需要先输入已配置的 API Key，页面才会通过 `/v1/config` 读取配置状态并保存修改。`/v1/config` 读写接口强制要求 `server.api_keys` 已配置并通过 Bearer 鉴权。
 
 ### 4. 动态配置热加载
 
 每次请求时重新读取 `config.json`，修改配置文件后立即生效，无需重启进程。
+鉴权热路径会缓存 `server.api_keys` 5 秒，Web 配置保存后会主动清空缓存。
 
 ### 5. OpenAI messages 主历史
 
@@ -230,3 +231,10 @@ for chunk in client.chat.completions.create(
 ### 6. 每请求独立 GitLab Duo workflow
 
 服务端不复用 GitLab checkpoint 作为主历史，避免不同客户端窗口或并发请求共享上下文。
+
+### 7. 生产安全与可靠性
+
+- `/healthz` 提供健康检查。
+- GitLab HTTP 请求、WebSocket 握手和回复等待都设置了超时，避免上游卡住时长期占用连接。
+- 上游详细错误写入服务端日志，客户端只收到脱敏后的 OpenAI 风格错误。
+- token 粗估改为按 UTF-8 字节计算，对中文上下文更接近真实消耗。
