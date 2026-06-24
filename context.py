@@ -9,6 +9,7 @@ from typing import Any
 
 
 MessageLike = dict[str, Any]
+ModelLike = dict[str, Any]
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -74,3 +75,9 @@ def fingerprint_messages(messages: Sequence[MessageLike]) -> str:
     canonical = json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"messages-{digest[:16]}"
+
+
+def is_known_model(model_id: str, models: Sequence[ModelLike]) -> bool:
+    if not model_id:
+        return False
+    return any(model_id in (model.get("id"), model.get("gitlab_id")) for model in models)

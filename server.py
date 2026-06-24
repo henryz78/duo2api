@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from context import build_prompt
+from context import build_prompt, is_known_model
 from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, resolve_gitlab_model_id
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -346,6 +346,13 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     cfg = _load_config()
     model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
+    if not is_known_model(model, ALL_MODELS):
+        return _openai_error(
+            400,
+            "model_not_found",
+            f"Model '{model}' not found. Call /v1/models for available models.",
+            param="model",
+        )
     prompt_tokens = _estimate_tokens(prompt)
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
 

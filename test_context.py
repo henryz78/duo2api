@@ -3,6 +3,7 @@ import unittest
 from context import (
     build_prompt,
     fingerprint_messages,
+    is_known_model,
 )
 
 
@@ -38,6 +39,16 @@ class ContextTests(unittest.TestCase):
         messages = [{"role": "user", "content": "hello"}]
 
         self.assertEqual(fingerprint_messages(messages), fingerprint_messages(messages))
+
+    def test_model_validation_accepts_public_and_legacy_ids(self):
+        models = [
+            {"id": "claude-sonnet-4.5", "gitlab_id": "claude_sonnet_4_5"},
+            {"id": "gpt-5-codex", "gitlab_id": "gpt_5_codex"},
+        ]
+
+        self.assertTrue(is_known_model("claude-sonnet-4.5", models))
+        self.assertTrue(is_known_model("claude_sonnet_4_5", models))
+        self.assertFalse(is_known_model("gpt-99-fake", models))
 
 
 if __name__ == "__main__":

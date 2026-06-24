@@ -197,6 +197,7 @@ for chunk in client.chat.completions.create(
 - **Cookie 有效期**：`remember_user_token` 通常有效期约 2 周，过期后需重新获取。
 - **对话历史**：服务每次使用客户端发来的完整 `messages` 作为上下文，不在服务端共享聊天历史。
 - **并发隔离**：每个请求创建独立 GitLab Duo workflow，不同客户端窗口不会通过服务端 session 串台。
+- **System prompt 限制**：GitLab Duo 可能拒绝执行自定义 system-like 指令；普通 user/assistant 历史会正常作为上下文传递。
 - **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`claude_opus_4_8` 需要 GitLab Duo Pro 权限，但目前用户可试用30天。
 
 ---

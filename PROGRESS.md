@@ -21,6 +21,7 @@
 - ✅ 配置文件热加载（修改 config.json 无需重启）
 - ✅ OpenAI `messages` 完整历史拼接
 - ✅ 每请求独立 GitLab Duo workflow，避免跨窗口/并发串台
+- ✅ 未知模型 ID 返回 `model_not_found`，不再透传上游
 - 🚧 工具调用（function calling）尚未实现
 - 🚧 联网搜索内置提示词尚未实现
 
@@ -197,6 +198,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [ ] **Web 配置界面**：浏览器里直接修改 config.json（更新 Cookie、切换模型等）
 - [x] **多 session 并发**：每个请求用独立 DuoChat 实例，支持并行对话
 - [x] **对话历史**：把 messages 数组拼成多轮对话传给 Duo
+- [x] **模型校验**：未知模型 ID 返回 OpenAI 风格 400 错误
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
 - [ ] **Docker 部署**：提供 Dockerfile，方便自托管
 
