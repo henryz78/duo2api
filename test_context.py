@@ -16,8 +16,9 @@ class ContextTests(unittest.TestCase):
             {"role": "user", "content": "Second question"},
         ])
 
-        self.assertIn("[System]\nYou are concise.", prompt)
-        self.assertIn("[User]\nFirst question", prompt)
+        self.assertNotIn("[System]", prompt)
+        self.assertIn("You are concise.", prompt)
+        self.assertIn("[User]\nYou are concise.", prompt)
         self.assertIn("[Assistant]\nFirst answer", prompt)
         self.assertTrue(prompt.endswith("[User]\nSecond question"))
 
@@ -34,6 +35,17 @@ class ContextTests(unittest.TestCase):
 
         self.assertIn("Describe this", prompt)
         self.assertIn("[image_url: https://example.com/a.png]", prompt)
+
+    def test_build_prompt_merges_all_system_messages_into_first_user(self):
+        prompt = build_prompt([
+            {"role": "user", "content": "First question"},
+            {"role": "system", "content": "Late system context"},
+            {"role": "user", "content": "Second question"},
+        ])
+
+        self.assertNotIn("[System]", prompt)
+        self.assertIn("[User]\nLate system context\n\nFirst question", prompt)
+        self.assertTrue(prompt.endswith("[User]\nSecond question"))
 
     def test_message_fingerprint_is_stable(self):
         messages = [{"role": "user", "content": "hello"}]

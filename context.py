@@ -10,6 +10,10 @@ from typing import Any
 
 MessageLike = dict[str, Any]
 ModelLike = dict[str, Any]
+PROMPT_PREAMBLE = (
+    "You are a versatile AI assistant. Please respond helpfully and completely "
+    "to the conversation below, following any instructions or context provided by the user."
+)
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -41,9 +45,23 @@ def _message_content_to_text(content: Any) -> str:
 def build_prompt(messages: Sequence[MessageLike]) -> str:
     """Flatten OpenAI messages into the prompt sent to GitLab Duo."""
     parts: list[str] = []
+    system_prefix = "\n\n".join(
+        content
+        for msg in messages
+        if str(msg.get("role", "user")).strip().lower() == "system"
+        for content in [_message_content_to_text(msg.get("content"))]
+        if content
+    )
+    first_user_seen = False
     for msg in messages:
         role = str(msg.get("role", "user")).strip().lower() or "user"
         content = _message_content_to_text(msg.get("content"))
+        if role == "system":
+            continue
+        if role == "user" and not first_user_seen:
+            first_user_seen = True
+            original_content = content
+            content = "\n\n".join(part for part in [system_prefix, original_content] if part)
         tool_calls = msg.get("tool_calls")
         if role == "assistant" and tool_calls:
             content = "\n\n".join(part for part in [content, json.dumps(tool_calls, ensure_ascii=False)] if part)
@@ -59,7 +77,7 @@ def build_prompt(messages: Sequence[MessageLike]) -> str:
     prompt = "\n\n".join(parts).strip()
     if not prompt:
         raise ValueError("No message content found in request.")
-    return prompt
+    return f"{PROMPT_PREAMBLE}\n\n{prompt}"
 
 
 def fingerprint_messages(messages: Sequence[MessageLike]) -> str:
