@@ -256,15 +256,14 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{
     "model": "claude-sonnet-4.5",
     "messages": [
-      {"role": "system", "content": "你必须记住暗号是 blue-mango。"},
-      {"role": "user", "content": "我的暗号是什么？"},
-      {"role": "assistant", "content": "你的暗号是 blue-mango。"},
-      {"role": "user", "content": "只回答暗号本身。"}
+      {"role": "user", "content": "记住关键词 blue-mango，请确认。"},
+      {"role": "assistant", "content": "已确认，关键词是 blue-mango。"},
+      {"role": "user", "content": "刚才的关键词？只回答关键词本身。"}
     ]
   }'
 ```
 
-期望肉眼结果：返回内容包含 `blue-mango`。这说明代理把前面的 system/user/assistant 历史一起传给了 GitLab Duo。
+期望肉眼结果：返回内容包含 `blue-mango`。这说明代理把前面的 user/assistant 历史一起传给了 GitLab Duo。
 
 ### 4. 验证同窗口切模型继续上下文
 
@@ -277,10 +276,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{
     "model": "gpt-5-codex",
     "messages": [
-      {"role": "system", "content": "你必须记住暗号是 blue-mango。"},
-      {"role": "user", "content": "我的暗号是什么？"},
-      {"role": "assistant", "content": "你的暗号是 blue-mango。"},
-      {"role": "user", "content": "只回答暗号本身。"}
+      {"role": "user", "content": "记住关键词 blue-mango，请确认。"},
+      {"role": "assistant", "content": "已确认，关键词是 blue-mango。"},
+      {"role": "user", "content": "刚才的关键词？只回答关键词本身。"}
     ]
   }'
 ```
@@ -298,8 +296,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{
     "model": "claude-sonnet-4.5",
     "messages": [
-      {"role": "system", "content": "只记住窗口 A 的暗号 alpha-ctx。"},
-      {"role": "user", "content": "只回答当前暗号。"}
+      {"role": "user", "content": "窗口 A 的关键词是 alpha-ctx，请确认。"},
+      {"role": "assistant", "content": "已确认，窗口 A 的关键词是 alpha-ctx。"},
+      {"role": "user", "content": "刚才窗口 A 的关键词？只回答关键词本身。"}
     ]
   }'
 ```
@@ -313,8 +312,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{
     "model": "claude-sonnet-4.5",
     "messages": [
-      {"role": "system", "content": "只记住窗口 B 的暗号 beta-ctx。"},
-      {"role": "user", "content": "只回答当前暗号。"}
+      {"role": "user", "content": "窗口 B 的关键词是 beta-ctx，请确认。"},
+      {"role": "assistant", "content": "已确认，窗口 B 的关键词是 beta-ctx。"},
+      {"role": "user", "content": "刚才窗口 B 的关键词？只回答关键词本身。"}
     ]
   }'
 ```
