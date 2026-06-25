@@ -1,8 +1,10 @@
+import json
 import unittest
 
 import responses_api
 from responses_api import (
     build_responses_prompt,
+    normalize_tool_call_for_response_tools,
     response_function_call_sse,
     responses_input_to_messages,
 )
@@ -142,6 +144,37 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertIn('"call_id": "call_abc"', text)
         self.assertIn('"name": "exec_command"', text)
         self.assertIn('"arguments": "{\\"cmd\\":\\"ls\\"}"', text)
+
+    def test_normalize_tool_call_uses_cmd_when_client_schema_requires_it(self):
+        tool_call = {
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "arguments": '{"command":"python3 hello.py"}',
+            },
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "justification": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+            },
+        ]
+
+        normalized = normalize_tool_call_for_response_tools(tool_call, tools)
+        arguments = json.loads(normalized["function"]["arguments"])
+
+        self.assertEqual(arguments, {"cmd": "python3 hello.py"})
 
 
 if __name__ == "__main__":

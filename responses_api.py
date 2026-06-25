@@ -33,6 +33,66 @@ def responses_named_tools(tools: Sequence[Mapping[str, Any]] | None) -> list[Map
     return named or None
 
 
+def _tool_parameters(tool: Mapping[str, Any]) -> Mapping[str, Any]:
+    function = tool.get("function")
+    if isinstance(function, Mapping):
+        parameters = function.get("parameters")
+        if isinstance(parameters, Mapping):
+            return parameters
+    parameters = tool.get("parameters")
+    return parameters if isinstance(parameters, Mapping) else {}
+
+
+def _tool_property_names(tool: Mapping[str, Any]) -> set[str]:
+    parameters = _tool_parameters(tool)
+    properties = parameters.get("properties")
+    if not isinstance(properties, Mapping):
+        return set()
+    return {str(name) for name in properties}
+
+
+def _find_response_tool_schema(name: str, tools: Sequence[Mapping[str, Any]] | None) -> Mapping[str, Any] | None:
+    for tool in tools or []:
+        if isinstance(tool, Mapping) and _response_tool_name(tool) == name:
+            return tool
+    return None
+
+
+def normalize_tool_call_for_response_tools(
+    tool_call: Mapping[str, Any],
+    tools: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    normalized = dict(tool_call)
+    function = normalized.get("function")
+    if not isinstance(function, Mapping):
+        return normalized
+
+    name = str(function.get("name", "")).strip()
+    schema = _find_response_tool_schema(name, tools)
+    if not schema:
+        return normalized
+
+    raw_arguments = function.get("arguments", "{}")
+    try:
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+    except (TypeError, ValueError):
+        return normalized
+    if not isinstance(arguments, dict):
+        return normalized
+
+    property_names = _tool_property_names(schema)
+    if name == "exec_command" and "cmd" in property_names and "cmd" not in arguments and "command" in arguments:
+        arguments["cmd"] = arguments["command"]
+        if "command" not in property_names:
+            arguments.pop("command", None)
+
+    normalized["function"] = {
+        **dict(function),
+        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+    }
+    return normalized
+
+
 def _response_content_to_text(content: Any) -> str:
     if content is None:
         return ""

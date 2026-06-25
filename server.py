@@ -41,6 +41,7 @@ from security import (
 )
 from responses_api import (
     build_responses_prompt,
+    normalize_tool_call_for_response_tools,
     response_completed_sse,
     response_created_sse,
     response_function_call_sse,
@@ -816,7 +817,13 @@ async def _do_responses_stream(
 
         usage = _responses_usage(prompt_tokens, completion_tokens)
         if tool_calls:
-            yield response_function_call_sse(resp_id, model, created_at, tool_calls[0], usage)
+            yield response_function_call_sse(
+                resp_id,
+                model,
+                created_at,
+                normalize_tool_call_for_response_tools(tool_calls[0], tools),
+                usage,
+            )
             return
 
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
