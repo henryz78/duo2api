@@ -20,7 +20,12 @@ def _response_tool_name(tool: Mapping[str, Any]) -> str:
 def responses_named_tools(tools: Sequence[Mapping[str, Any]] | None) -> list[Mapping[str, Any]] | None:
     if not tools:
         return None
-    named = [tool for tool in tools if isinstance(tool, Mapping) and _response_tool_name(tool)]
+    named = [
+        tool for tool in tools
+        if isinstance(tool, Mapping)
+        and str(tool.get("type", "")).strip() == "function"
+        and _response_tool_name(tool)
+    ]
     return named or None
 
 
@@ -91,11 +96,19 @@ def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     return messages
 
 
+def responses_body_to_messages(body: Mapping[str, Any]) -> list[dict[str, Any]]:
+    messages = responses_input_to_messages(body.get("input"))
+    instructions = str(body.get("instructions") or "").strip()
+    if instructions:
+        return [{"role": "system", "content": instructions}] + messages
+    return messages
+
+
 def build_responses_prompt(body: Mapping[str, Any]) -> str:
     tool_choice = body.get("tool_choice")
     tools = None if tool_choice == "none" else body.get("tools")
     return build_prompt(
-        responses_input_to_messages(body.get("input")),
+        responses_body_to_messages(body),
         tools=tools,
         tool_choice=tool_choice,
     )

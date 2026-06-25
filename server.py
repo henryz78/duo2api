@@ -18,6 +18,7 @@ from context import (
     build_tool_retry_prompt,
     extract_tool_calls,
     is_known_model,
+    should_retry_required_tool_choice,
     should_retry_auto_tool_choice,
     validate_tools,
 )
@@ -43,8 +44,8 @@ from responses_api import (
     response_completed_sse,
     response_created_sse,
     response_function_call_sse,
+    responses_body_to_messages,
     responses_named_tools,
-    responses_input_to_messages,
     sse_event,
     text_output_items,
 )
@@ -185,7 +186,10 @@ async def _send_with_optional_tool_retry(
     tool_calls = extract_tool_calls(full)
     if tool_calls:
         return full, tool_calls, completion_tokens
-    if not should_retry_auto_tool_choice(messages, tools, tool_choice, full):
+    if not (
+        should_retry_required_tool_choice(tools, tool_choice, full)
+        or should_retry_auto_tool_choice(messages, tools, tool_choice, full)
+    ):
         return full, [], completion_tokens
 
     retry_full = await session.send(build_tool_retry_prompt(prompt), model=upstream_model)
@@ -627,7 +631,7 @@ async def responses(request: Request, body: ResponsesRequest):
             model,
             upstream_model,
             tools_enabled=tools_allowed,
-            messages=responses_input_to_messages(body.input),
+            messages=responses_body_to_messages(body_data),
             tools=named_tools,
             tool_choice=body.tool_choice,
         ),

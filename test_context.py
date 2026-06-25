@@ -7,6 +7,7 @@ from context import (
     fingerprint_messages,
     is_known_model,
     should_retry_auto_tool_choice,
+    should_retry_required_tool_choice,
     validate_tools,
 )
 
@@ -119,6 +120,37 @@ class ContextTests(unittest.TestCase):
         ]
 
         self.assertFalse(should_retry_auto_tool_choice(messages, tools, "none", "北京今天晴。"))
+
+    def test_should_retry_auto_tool_choice_detects_system_coding_intent(self):
+        messages = [{"role": "system", "content": "Create hello.py and run python hello.py"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "exec_command", "parameters": {"type": "object"}},
+            }
+        ]
+
+        self.assertTrue(should_retry_auto_tool_choice(messages, tools, "auto", "Creating hello.py."))
+
+    def test_should_retry_required_tool_choice_when_model_returns_prose(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "exec_command", "parameters": {"type": "object"}},
+            }
+        ]
+
+        self.assertTrue(should_retry_required_tool_choice(tools, "required", "Creating hello.py."))
+        self.assertTrue(should_retry_required_tool_choice(
+            tools,
+            {"type": "function", "function": {"name": "exec_command"}},
+            "Creating hello.py.",
+        ))
+        self.assertFalse(should_retry_required_tool_choice(
+            tools,
+            "required",
+            '{"tool_calls":[{"name":"exec_command","arguments":{"command":"echo ok"}}]}',
+        ))
 
     def test_build_tool_retry_prompt_adds_stronger_json_only_instruction(self):
         prompt = build_tool_retry_prompt("base prompt")

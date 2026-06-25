@@ -24,10 +24,20 @@ class ResponsesApiTests(unittest.TestCase):
             helper([
                 {"type": "computer_use_preview"},
                 {"type": "function", "function": {}},
+                {"type": "custom", "name": "apply_patch", "format": {"type": "grammar"}},
                 named_tool,
             ]),
             [named_tool],
         )
+
+    def test_build_responses_prompt_includes_instructions_as_system_context(self):
+        prompt = build_responses_prompt({
+            "instructions": "You are Codex. Use tools for local file operations.",
+            "input": "Create hello.py and run it.",
+        })
+
+        self.assertIn("You are Codex. Use tools for local file operations.", prompt)
+        self.assertIn("[User]\nYou are Codex. Use tools for local file operations.\n\nCreate hello.py", prompt)
 
     def test_responses_input_to_messages_preserves_task_and_tool_output(self):
         messages = responses_input_to_messages([

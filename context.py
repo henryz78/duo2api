@@ -17,12 +17,14 @@ PROMPT_PREAMBLE = (
 TOOL_CALLING_INSTRUCTIONS = (
     "When a tool is needed, respond only with a JSON object in this exact shape: "
     '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
+    "Use tools for requests that ask you to run commands, create files, edit files, "
+    "inspect local state, fetch data, search, query, convert, read, or execute. "
     "When no tool is needed, answer normally."
 )
 TOOL_RETRY_INSTRUCTIONS = (
     "You must respond only with a JSON object matching this shape: "
     '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
-    "Choose the best available tool for the user's request. Do not include prose."
+    "Choose the best available tool for the request. Do not include prose."
 )
 TOOL_INTENT_KEYWORDS = (
     "调用",
@@ -46,6 +48,16 @@ TOOL_INTENT_KEYWORDS = (
     "read",
     "run",
     "execute",
+    "create",
+    "write",
+    "edit",
+    "file",
+    "command",
+    "shell",
+    "terminal",
+    "python",
+    "bash",
+    "powershell",
 )
 
 
@@ -176,8 +188,46 @@ def _latest_user_text(messages: Sequence[MessageLike]) -> str:
     return ""
 
 
+def _latest_request_text(messages: Sequence[MessageLike]) -> str:
+    latest_user = _latest_user_text(messages)
+    if latest_user:
+        return latest_user
+    for msg in reversed(messages):
+        role = str(msg.get("role", "")).strip().lower()
+        if role in {"assistant", "tool", "function"}:
+            continue
+        text = _message_content_to_text(msg.get("content"))
+        if text:
+            return text
+    return ""
+
+
 def _is_auto_tool_choice(tool_choice: Any) -> bool:
     return tool_choice is None or tool_choice == "auto"
+
+
+def _is_required_tool_choice(tool_choice: Any) -> bool:
+    if tool_choice == "required":
+        return True
+    if not isinstance(tool_choice, Mapping):
+        return False
+    choice_type = str(tool_choice.get("type", "")).strip()
+    if choice_type in {"function", "custom"}:
+        return True
+    if choice_type == "allowed_tools":
+        allowed = tool_choice.get("allowed_tools")
+        return isinstance(allowed, Mapping) and allowed.get("mode") == "required"
+    return False
+
+
+def should_retry_required_tool_choice(
+    tools: Sequence[Mapping[str, Any]] | None,
+    tool_choice: Any,
+    model_text: str,
+) -> bool:
+    if not tools or not _is_required_tool_choice(tool_choice):
+        return False
+    return not bool(extract_tool_calls(model_text))
 
 
 def should_retry_auto_tool_choice(
@@ -190,10 +240,10 @@ def should_retry_auto_tool_choice(
         return False
     if extract_tool_calls(model_text):
         return False
-    latest_user = _latest_user_text(messages).lower()
-    if not latest_user:
+    latest_request = _latest_request_text(messages).lower()
+    if not latest_request:
         return False
-    if any(keyword in latest_user for keyword in TOOL_INTENT_KEYWORDS):
+    if any(keyword in latest_request for keyword in TOOL_INTENT_KEYWORDS):
         return True
     tool_names = [
         name.lower()
@@ -201,7 +251,7 @@ def should_retry_auto_tool_choice(
         for name in [_tool_name(tool)]
         if name
     ]
-    return any(name in latest_user for name in tool_names)
+    return any(name in latest_request for name in tool_names)
 
 
 def build_prompt(
