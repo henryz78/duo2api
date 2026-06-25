@@ -170,6 +170,8 @@ def build_tool_retry_prompt(
             "Do not describe what you will do.",
             "Do not answer in prose.",
             "Do not use markdown.",
+            "Do not use GitLab Duo built-in tools such as create_file_with_contents or run_command.",
+            "Do not request tool approval.",
             "The first character must be {.",
             "The full response must match this schema exactly:",
             schema,

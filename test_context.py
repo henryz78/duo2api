@@ -181,6 +181,8 @@ class ContextTests(unittest.TestCase):
         self.assertIn("[Compatibility Tool Adapter]", prompt)
         self.assertIn("User request:\n帮我看看目前系统状态", prompt)
         self.assertIn('"name":"exec_command"', prompt)
+        self.assertIn("Do not use GitLab Duo built-in tools", prompt)
+        self.assertIn("Do not request tool approval", prompt)
         self.assertIn("Previous invalid response:", prompt)
         self.assertIn("What local action would you like me to perform?", prompt)
         self.assertIn('{"tool_calls":[{"name":"exec_command","arguments":{"command":"..."}}]}', prompt)
