@@ -1,10 +1,11 @@
 import asyncio
 import json
 import re
+import shlex
 import time
 import httpx
 import websockets
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +278,72 @@ def _extract_new_agent_content(checkpoint_json: str, seen_id: str | None) -> tup
     return None, None
 
 
+def _extract_pending_tool_info(checkpoint_json: str) -> dict[str, Any] | None:
+    inner = _parse_checkpoint(checkpoint_json)
+    log = inner.get("channel_values", {}).get("ui_chat_log", [])
+    for entry in reversed(log):
+        if entry.get("message_type") != "request":
+            continue
+        tool_info = entry.get("tool_info")
+        if isinstance(tool_info, Mapping):
+            return dict(tool_info)
+    return None
+
+
+def _exec_command_call(command: str) -> str:
+    return json.dumps({
+        "tool_calls": [{
+            "name": "exec_command",
+            "arguments": {"command": command},
+        }]
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _create_file_command(args: Mapping[str, Any]) -> str:
+    file_path = str(args.get("file_path") or args.get("path") or "").strip()
+    contents = str(args.get("contents") or args.get("content") or "")
+    if not file_path:
+        return ""
+    script = "\n".join([
+        "from pathlib import Path",
+        f"path = Path({json.dumps(file_path, ensure_ascii=False)})",
+        f"contents = {json.dumps(contents, ensure_ascii=False)}",
+        "path.parent.mkdir(parents=True, exist_ok=True)",
+        "path.write_text(contents, encoding='utf-8')",
+    ])
+    return "python3 - <<'PY'\n" + script + "\nPY"
+
+
+def _run_command(args: Mapping[str, Any]) -> str:
+    program = str(args.get("program") or args.get("command") or "").strip()
+    raw_args = args.get("args")
+    if isinstance(raw_args, list):
+        arg_text = " ".join(shlex.quote(str(arg)) for arg in raw_args)
+    else:
+        arg_text = str(raw_args or "").strip()
+    if program and arg_text:
+        return f"{program} {arg_text}"
+    return program or arg_text
+
+
+def _duo_tool_info_to_tool_call_text(tool_info: Mapping[str, Any] | None) -> str | None:
+    if not tool_info:
+        return None
+    name = str(tool_info.get("name") or "").strip()
+    args = tool_info.get("args")
+    if not isinstance(args, Mapping):
+        args = {}
+    if name == "create_file_with_contents":
+        command = _create_file_command(args)
+    elif name == "run_command":
+        command = _run_command(args)
+    else:
+        return None
+    if not command:
+        return None
+    return _exec_command_call(command)
+
+
 async def _recv_until_done(ws, workflow_id: str, seen_id: str | None = None) -> tuple[str, str, str | None]:
     last_checkpoint = ""
     final_answer = ""
@@ -303,6 +370,11 @@ async def _recv_until_done(ws, workflow_id: str, seen_id: str | None = None) -> 
                 printed_len = len(content)
 
         if status in ("INPUT_REQUIRED", "COMPLETE"):
+            break
+        elif status == "TOOL_CALL_APPROVAL_REQUIRED":
+            bridged = _duo_tool_info_to_tool_call_text(_extract_pending_tool_info(last_checkpoint))
+            if bridged:
+                final_answer = bridged
             break
         elif status == "FAILED":
             raise RuntimeError(f"Workflow failed: {cp.get('errors', [])}")
