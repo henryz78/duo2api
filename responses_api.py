@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from context import build_prompt
+
+
+_PYTHON_FILE_RE = re.compile(r"([A-Za-z0-9_.\\/.-]+\.py)\b")
 
 
 def _response_tool_name(tool: Mapping[str, Any]) -> str:
@@ -57,6 +61,64 @@ def _response_content_to_text(content: Any) -> str:
     return str(content).strip()
 
 
+def _extract_python_file_name(*texts: str) -> str:
+    for text in texts:
+        match = _PYTHON_FILE_RE.search(text or "")
+        if match:
+            return match.group(1).replace("\\", "/").split("/")[-1]
+    return ""
+
+
+def _tool_arguments_to_text(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    if isinstance(arguments, Mapping):
+        return json.dumps(arguments, ensure_ascii=False)
+    return str(arguments or "")
+
+
+def _tool_followup_guidance(
+    user_text: str,
+    tool_name: str,
+    arguments_text: str,
+    output_text: str,
+) -> list[str]:
+    user_lower = user_text.lower()
+    run_intent = any(phrase in user_lower for phrase in (
+        "then run",
+        "run it",
+        "execute it",
+        "运行",
+        "执行",
+    ))
+    if not run_intent or tool_name != "exec_command":
+        return []
+
+    filename = _extract_python_file_name(output_text, arguments_text, user_text)
+    if not filename:
+        return []
+
+    action_text = f"{arguments_text}\n{output_text}".lower()
+    wrote_file = any(marker in action_text for marker in (
+        "write_text",
+        "created",
+        "written",
+        "write ",
+        "cat >",
+        "printf",
+        "set-content",
+        "new-item",
+    ))
+    if not wrote_file:
+        return []
+
+    return [
+        f"Completed step: {filename} has been written.",
+        f"Remaining task: run {filename} with Python and report the output.",
+        f"Do not recreate or rewrite {filename}.",
+    ]
+
+
 def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
@@ -64,6 +126,9 @@ def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         return []
 
     messages: list[dict[str, Any]] = []
+    latest_user_text = ""
+    last_function_call_name = ""
+    last_function_call_arguments = ""
     for item in input_value:
         if not isinstance(item, Mapping):
             continue
@@ -75,11 +140,15 @@ def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
             content = _response_content_to_text(item.get("content"))
             if content:
                 messages.append({"role": role, "content": content})
+                if role == "user":
+                    latest_user_text = content
         elif item_type == "function_call":
             name = str(item.get("name", "")).strip()
             arguments = item.get("arguments", "{}")
             call_id = str(item.get("call_id") or item.get("id") or "").strip()
             if name:
+                last_function_call_name = name
+                last_function_call_arguments = _tool_arguments_to_text(arguments)
                 messages.append({
                     "role": "assistant",
                     "content": "",
@@ -93,13 +162,20 @@ def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
             output = _response_content_to_text(item.get("output"))
             call_id = str(item.get("call_id") or "").strip()
             header = f"Previous local tool call {call_id} completed." if call_id else "Previous local tool call completed."
-            content = "\n".join([
+            parts = [
                 header,
                 "Tool output:",
                 output or "(no output)",
+                *_tool_followup_guidance(
+                    latest_user_text,
+                    last_function_call_name,
+                    last_function_call_arguments,
+                    output,
+                ),
                 "Continue the original user request from this state.",
                 "Do not repeat completed tool calls; use the next required tool call or provide the final answer.",
-            ])
+            ]
+            content = "\n".join(parts)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
     return messages
 

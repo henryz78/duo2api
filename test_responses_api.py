@@ -93,6 +93,9 @@ class ResponsesApiTests(unittest.TestCase):
 
         self.assertIn("[Tool Result call_123]", prompt)
         self.assertIn("Previous local tool call call_123 completed.", prompt)
+        self.assertIn("Completed step: hello.py has been written.", prompt)
+        self.assertIn("Remaining task: run hello.py with Python and report the output.", prompt)
+        self.assertIn("Do not recreate or rewrite hello.py.", prompt)
         self.assertIn("Continue the original user request", prompt)
         self.assertIn("Do not repeat completed tool calls", prompt)
 
