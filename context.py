@@ -19,6 +19,9 @@ TOOL_CALLING_INSTRUCTIONS = (
     '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
     "Use tools for requests that ask you to run commands, create files, edit files, "
     "inspect local state, fetch data, search, query, convert, read, or execute. "
+    "Do not use GitLab Duo built-in tools. "
+    "Do not request tool approval. "
+    "Output only the JSON tool call for the user-provided tools. "
     "When no tool is needed, answer normally."
 )
 TOOL_RETRY_INSTRUCTIONS = (

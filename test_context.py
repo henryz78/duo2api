@@ -72,6 +72,9 @@ class ContextTests(unittest.TestCase):
         self.assertIn('"name":"get_time"', prompt)
         self.assertIn('"tool_choice":"auto"', prompt)
         self.assertIn('"tool_calls"', prompt)
+        self.assertIn("Do not use GitLab Duo built-in tools", prompt)
+        self.assertIn("Do not request tool approval", prompt)
+        self.assertIn("Output only the JSON tool call for the user-provided tools", prompt)
 
     def test_extract_tool_calls_normalizes_model_json(self):
         calls = extract_tool_calls(
