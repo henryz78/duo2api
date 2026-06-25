@@ -2,6 +2,7 @@ import unittest
 
 from context import (
     build_prompt,
+    extract_tool_calls,
     fingerprint_messages,
     is_known_model,
 )
@@ -46,6 +47,37 @@ class ContextTests(unittest.TestCase):
         self.assertNotIn("[System]", prompt)
         self.assertIn("[User]\nLate system context\n\nFirst question", prompt)
         self.assertTrue(prompt.endswith("[User]\nSecond question"))
+
+    def test_build_prompt_appends_tool_instructions_when_tools_are_present(self):
+        prompt = build_prompt(
+            [{"role": "user", "content": "What time is it?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": "Get current time",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        self.assertIn("[Available Tools]", prompt)
+        self.assertIn('"name":"get_time"', prompt)
+        self.assertIn('"tool_choice":"auto"', prompt)
+        self.assertIn('"tool_calls"', prompt)
+
+    def test_extract_tool_calls_normalizes_model_json(self):
+        calls = extract_tool_calls(
+            '```json\n{"tool_calls":[{"name":"get_time","arguments":{"zone":"UTC"}}]}\n```'
+        )
+
+        self.assertEqual(calls[0]["id"], "call_0")
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertEqual(calls[0]["function"]["name"], "get_time")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"zone":"UTC"}')
 
     def test_message_fingerprint_is_stable(self):
         messages = [{"role": "user", "content": "hello"}]

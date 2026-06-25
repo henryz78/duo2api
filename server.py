@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from context import build_prompt, is_known_model
+from context import build_prompt, extract_tool_calls, is_known_model
 from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, probe_gitlab_auth
 from security import (
     apply_config_update,
@@ -82,10 +82,16 @@ class ChatRequest(BaseModel):
     frequency_penalty: float | None = None
     stop: list[str] | str | None = None
     user: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
 
-def _build_prompt(messages: list[Message]) -> str:
-    return build_prompt([m.model_dump(exclude_none=True) for m in messages])
+def _build_prompt(body: ChatRequest) -> str:
+    return build_prompt(
+        [m.model_dump(exclude_none=True) for m in body.messages],
+        tools=body.tools,
+        tool_choice=body.tool_choice,
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -98,9 +104,17 @@ def _sse(payload: dict) -> str:
 
 def _chunk(req_id: str, model: str, content: str = "", finish_reason: str | None = None) -> str:
     delta = {"content": content} if content else {}
+    return _chunk_delta(req_id, model, delta, finish_reason=finish_reason)
+
+
+def _chunk_delta(req_id: str, model: str, delta: dict, finish_reason: str | None = None) -> str:
     return _sse({"id": req_id, "object": "chat.completion.chunk",
                  "created": int(time.time()), "model": model,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]})
+
+
+def _tool_call_deltas(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"index": index, **tool_call} for index, tool_call in enumerate(tool_calls)]
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +457,7 @@ async def chat_completions(request: Request, body: ChatRequest):
         return err
 
     try:
-        prompt = _build_prompt(body.messages)
+        prompt = _build_prompt(body)
     except ValueError as e:
         return _openai_error(400, "invalid_request_error", str(e), param="messages")
 
@@ -461,15 +475,15 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     if body.stream:
         return StreamingResponse(
-            _do_stream(prompt, req_id, prompt_tokens, model),
+            _do_stream(prompt, req_id, prompt_tokens, model, tools_enabled=bool(body.tools)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return await _do_complete(prompt, req_id, prompt_tokens, model)
+    return await _do_complete(prompt, req_id, prompt_tokens, model, tools_enabled=bool(body.tools))
 
 
-async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str):
+async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str, *, tools_enabled: bool = False):
     session = DuoChat()
     try:
         full = await session.send(prompt, model=model)
@@ -480,6 +494,17 @@ async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str)
         await session.close()
 
     completion_tokens = _estimate_tokens(full)
+    tool_calls = extract_tool_calls(full) if tools_enabled else []
+    if tool_calls:
+        return JSONResponse(content={
+            "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                                 "tool_calls": tool_calls},
+                         "finish_reason": "tool_calls", "logprobs": None}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens + completion_tokens},
+            "system_fingerprint": None,
+        })
     return JSONResponse(content={
         "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": full},
@@ -490,7 +515,7 @@ async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str)
     })
 
 
-async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
+async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, *, tools_enabled: bool = False):
     session = DuoChat()
 
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -498,6 +523,38 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str):
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
 
     completion_tokens = 0
+    if tools_enabled:
+        try:
+            full = await session.send(prompt, model=model)
+        except Exception as e:
+            logger.warning("GitLab Duo upstream stream error: %s", e)
+            yield _sse({"error": {"message": public_upstream_error_message(e), "type": "server_error", "code": "upstream_error"}})
+            yield "data: [DONE]\n\n"
+            return
+        finally:
+            await session.close()
+
+        completion_tokens = _estimate_tokens(full)
+        tool_calls = extract_tool_calls(full)
+        if tool_calls:
+            yield _chunk_delta(req_id, model, {"tool_calls": _tool_call_deltas(tool_calls)})
+            yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                                  "total_tokens": prompt_tokens + completion_tokens}})
+            yield "data: [DONE]\n\n"
+            return
+        if full:
+            yield _chunk(req_id, model, content=full)
+        yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                              "total_tokens": prompt_tokens + completion_tokens}})
+        yield "data: [DONE]\n\n"
+        return
+
     try:
         async for chunk in session.stream(prompt, model=model):
             completion_tokens += _estimate_tokens(chunk)

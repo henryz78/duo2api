@@ -28,7 +28,7 @@
 - ✅ `/healthz` 健康检查
 - ✅ `/v1/gitlab/health?deep=true` 主动检测 GitLab Cookie 与 Duo workflow
 - ✅ 上游错误对客户端脱敏，详细信息写服务端日志
-- 🚧 工具调用（function calling）尚未实现
+- ✅ 工具调用兼容层：OpenAI `tools/tool_choice` 通过 prompt 模拟，响应包装为 `tool_calls`
 - 🚧 联网搜索内置提示词尚未实现
 
 ---
@@ -205,7 +205,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
 
 ## 下一步计划
 
-- [ ] **工具调用（function calling）**：解析 OpenAI tools 格式，转换为 system prompt 注入到 Duo Chat
+- [x] **工具调用（function calling）**：解析 OpenAI tools 格式，转换为 prompt 指令并包装 OpenAI `tool_calls`
 - [ ] **联网搜索内置提示词**：system prompt 里注入搜索指令，让模型知道何时触发搜索
 - [x] **Web 配置界面**：浏览器里直接修改 config.json（更新 Cookie、切换模型等）
 - [x] **多 session 并发**：每个请求用独立 DuoChat 实例，支持并行对话
@@ -233,7 +233,7 @@ python -m py_compile context.py security.py server.py gitlab_duo_client.py test_
 期望结果：
 
 ```text
-Ran 5 tests
+Ran 7 tests
 OK
 ```
 
@@ -248,6 +248,8 @@ OK
 
 它覆盖：
 
+- OpenAI `tools/tool_choice` prompt 注入
+- 模型 JSON `tool_calls` 解析与 OpenAI 格式规范化
 - 配置状态只返回是否已配置和数量，不返回 Cookie / API Key 明文
 - API key TTL 缓存可清理
 - Web 表单里的遮罩值不会被写回配置
@@ -437,6 +439,55 @@ curl -i http://localhost:8000/v1/config \
 ```
 
 期望肉眼结果：HTTP 400，提示提交完整 API Key 或留空。随后再次 `GET /v1/config`，`api_keys_count` 保持原数量。
+
+### 8. 验证工具调用兼容层
+
+发送一个最小 tools 请求：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [{"role": "user", "content": "调用 get_time 工具，只输出工具调用 JSON。"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get current server time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+期望肉眼结果：响应 `choices[0].message.tool_calls` 存在，`finish_reason` 为 `tool_calls`，函数名为 `get_time`。
+
+流式验证：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [{"role": "user", "content": "调用 get_time 工具，只输出工具调用 JSON。"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get current server time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }],
+    "tool_choice": "auto",
+    "stream": true
+  }'
+```
+
+期望肉眼结果：SSE 里出现 `delta.tool_calls`，结束帧 `finish_reason` 为 `tool_calls`，最后是 `data: [DONE]`。
 
 ---
 

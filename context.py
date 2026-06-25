@@ -14,6 +14,11 @@ PROMPT_PREAMBLE = (
     "You are a versatile AI assistant. Please respond helpfully and completely "
     "to the conversation below, following any instructions or context provided by the user."
 )
+TOOL_CALLING_INSTRUCTIONS = (
+    "When a tool is needed, respond only with a JSON object in this exact shape: "
+    '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
+    "When no tool is needed, answer normally."
+)
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -42,7 +47,80 @@ def _message_content_to_text(content: Any) -> str:
     return str(content).strip()
 
 
-def build_prompt(messages: Sequence[MessageLike]) -> str:
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tools_prompt(tools: Sequence[Mapping[str, Any]] | None, tool_choice: Any = None) -> str:
+    if not tools:
+        return ""
+    payload = {
+        "tools": list(tools),
+        "tool_choice": "auto" if tool_choice is None else tool_choice,
+        "tool_response_format": {"tool_calls": [{"name": "tool_name", "arguments": {}}]},
+    }
+    return "\n\n".join([
+        "[Available Tools]",
+        _compact_json(payload),
+        "[Tool Calling Instructions]",
+        TOOL_CALLING_INSTRUCTIONS,
+    ])
+
+
+def _normalize_tool_call(call: Mapping[str, Any], index: int) -> dict[str, Any] | None:
+    function = call.get("function")
+    if isinstance(function, Mapping):
+        name = str(function.get("name", "")).strip()
+        arguments = function.get("arguments", {})
+    else:
+        name = str(call.get("name", "")).strip()
+        arguments = call.get("arguments", {})
+    if not name:
+        return None
+    if not isinstance(arguments, str):
+        arguments = _compact_json(arguments)
+    return {
+        "id": str(call.get("id") or f"call_{index}"),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
+
+
+def extract_tool_calls(text: str) -> list[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        raw_calls = value.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            continue
+        calls = [
+            normalized
+            for call_index, call in enumerate(raw_calls)
+            if isinstance(call, Mapping)
+            for normalized in [_normalize_tool_call(call, call_index)]
+            if normalized is not None
+        ]
+        if calls:
+            return calls
+    return []
+
+
+def build_prompt(
+    messages: Sequence[MessageLike],
+    *,
+    tools: Sequence[Mapping[str, Any]] | None = None,
+    tool_choice: Any = None,
+) -> str:
     """Flatten OpenAI messages into the prompt sent to GitLab Duo."""
     parts: list[str] = []
     system_prefix = "\n\n".join(
@@ -77,6 +155,9 @@ def build_prompt(messages: Sequence[MessageLike]) -> str:
     prompt = "\n\n".join(parts).strip()
     if not prompt:
         raise ValueError("No message content found in request.")
+    tool_prompt = _tools_prompt(tools, tool_choice)
+    if tool_prompt:
+        prompt = f"{prompt}\n\n{tool_prompt}"
     return f"{PROMPT_PREAMBLE}\n\n{prompt}"
 
 

@@ -146,8 +146,31 @@ curl http://localhost:8000/v1/chat/completions \
       {"role": "system", "content": "你是一个代码专家"},
       {"role": "user", "content": "用 Python 写一个快速排序"}
     ]
+}'
+```
+
+**工具调用（prompt 模拟）：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.5",
+    "messages": [{"role": "user", "content": "调用 get_time 工具"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get current server time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }],
+    "tool_choice": "auto"
   }'
 ```
+
+GitLab Duo 未暴露外部自定义工具 schema。本项目会把 OpenAI `tools` / `tool_choice` 序列化进 prompt，引导模型输出 JSON tool_calls，再包装成 OpenAI `tool_calls` 响应。
 
 **流式：**
 
@@ -253,3 +276,7 @@ for chunk in client.chat.completions.create(
 - GitLab HTTP 请求、WebSocket 握手和回复等待都设置了超时，避免上游卡住时长期占用连接。
 - 上游详细错误写入服务端日志，客户端只收到脱敏后的 OpenAI 风格错误。
 - token 粗估改为按 UTF-8 字节计算，对中文上下文更接近真实消耗。
+
+### 8. 工具调用兼容层
+
+GitLab Duo WebSocket 当前只暴露内部工具字段，外部自定义工具 schema 通过 prompt 模拟兼容 OpenAI `tools`。非流式请求会返回标准 `message.tool_calls`；流式请求在工具场景下会先等待完整上游回复，再发送 `delta.tool_calls` 和 `finish_reason=tool_calls`。
