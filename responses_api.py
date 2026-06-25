@@ -12,6 +12,10 @@ from context import build_prompt
 
 
 _PYTHON_FILE_RE = re.compile(r"([A-Za-z0-9_.\\/.-]+\.py)\b")
+_REMAINING_PYTHON_RUN_RE = re.compile(
+    r"Remaining task:\s*run\s+([A-Za-z0-9_.\\/.-]+\.py)\s+with Python",
+    re.IGNORECASE,
+)
 
 
 def _response_tool_name(tool: Mapping[str, Any]) -> str:
@@ -91,6 +95,81 @@ def normalize_tool_call_for_response_tools(
         "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
     }
     return normalized
+
+
+def _tool_call_arguments_dict(tool_call: Mapping[str, Any]) -> dict[str, Any] | None:
+    function = tool_call.get("function")
+    if not isinstance(function, Mapping):
+        return None
+    raw_arguments = function.get("arguments", "{}")
+    try:
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+    except (TypeError, ValueError):
+        return None
+    return arguments if isinstance(arguments, dict) else None
+
+
+def _with_tool_call_arguments(tool_call: Mapping[str, Any], arguments: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(tool_call)
+    function = normalized.get("function")
+    if not isinstance(function, Mapping):
+        return normalized
+    normalized["function"] = {
+        **dict(function),
+        "arguments": json.dumps(dict(arguments), ensure_ascii=False, separators=(",", ":")),
+    }
+    return normalized
+
+
+def _remaining_python_run_file(messages: Sequence[Mapping[str, Any]] | None) -> str:
+    for message in reversed(messages or []):
+        if not isinstance(message, Mapping):
+            continue
+        content = _response_content_to_text(message.get("content"))
+        match = _REMAINING_PYTHON_RUN_RE.search(content)
+        if match:
+            return match.group(1).replace("\\", "/").split("/")[-1]
+    return ""
+
+
+def _command_writes_python_file(command: str, filename: str) -> bool:
+    if not filename or filename not in command:
+        return False
+    command_lower = command.lower()
+    return any(marker in command_lower for marker in (
+        "write_text",
+        "cat >",
+        "printf",
+        "set-content",
+        "new-item",
+        "out-file",
+    ))
+
+
+def normalize_tool_call_for_response(
+    tool_call: Mapping[str, Any],
+    tools: Sequence[Mapping[str, Any]] | None,
+    messages: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    normalized = normalize_tool_call_for_response_tools(tool_call, tools)
+    function = normalized.get("function")
+    if not isinstance(function, Mapping) or function.get("name") != "exec_command":
+        return normalized
+
+    filename = _remaining_python_run_file(messages)
+    arguments = _tool_call_arguments_dict(normalized)
+    if not filename or arguments is None:
+        return normalized
+
+    command_key = "cmd" if "cmd" in arguments else "command"
+    command = str(arguments.get(command_key, ""))
+    if not _command_writes_python_file(command, filename):
+        return normalized
+
+    arguments[command_key] = f"python3 {filename}"
+    if command_key == "cmd":
+        arguments.pop("command", None)
+    return _with_tool_call_arguments(normalized, arguments)
 
 
 def _response_content_to_text(content: Any) -> str:

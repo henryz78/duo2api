@@ -41,6 +41,7 @@ from security import (
 )
 from responses_api import (
     build_responses_prompt,
+    normalize_tool_call_for_response,
     normalize_tool_call_for_response_tools,
     response_completed_sse,
     response_created_sse,
@@ -821,7 +822,7 @@ async def _do_responses_stream(
                 resp_id,
                 model,
                 created_at,
-                normalize_tool_call_for_response_tools(tool_calls[0], tools),
+                normalize_tool_call_for_response(tool_calls[0], tools, messages),
                 usage,
             )
             return

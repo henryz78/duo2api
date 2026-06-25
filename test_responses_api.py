@@ -4,6 +4,7 @@ import unittest
 import responses_api
 from responses_api import (
     build_responses_prompt,
+    normalize_tool_call_for_response,
     normalize_tool_call_for_response_tools,
     response_function_call_sse,
     responses_input_to_messages,
@@ -172,6 +173,52 @@ class ResponsesApiTests(unittest.TestCase):
         ]
 
         normalized = normalize_tool_call_for_response_tools(tool_call, tools)
+        arguments = json.loads(normalized["function"]["arguments"])
+
+        self.assertEqual(arguments, {"cmd": "python3 hello.py"})
+
+    def test_normalize_tool_call_runs_remaining_python_file_instead_of_rewriting_it(self):
+        tool_call = {
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "arguments": json.dumps({
+                    "command": (
+                        "python3 - <<'PY'\n"
+                        "from pathlib import Path\n"
+                        "Path(\"hello.py\").write_text('print(\"CODEX_GPT55_OK\")\\n')\n"
+                        "PY"
+                    )
+                }),
+            },
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            },
+        ]
+        messages = [
+            {
+                "role": "tool",
+                "content": "\n".join([
+                    "Previous local tool call call_0 completed.",
+                    "Completed step: hello.py has been written.",
+                    "Remaining task: run hello.py with Python and report the output.",
+                    "Do not recreate or rewrite hello.py.",
+                ]),
+            }
+        ]
+
+        normalized = normalize_tool_call_for_response(tool_call, tools, messages)
         arguments = json.loads(normalized["function"]["arguments"])
 
         self.assertEqual(arguments, {"cmd": "python3 hello.py"})
