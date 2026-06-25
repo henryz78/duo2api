@@ -10,6 +10,20 @@ from typing import Any
 from context import build_prompt
 
 
+def _response_tool_name(tool: Mapping[str, Any]) -> str:
+    function = tool.get("function")
+    if isinstance(function, Mapping):
+        return str(function.get("name", "")).strip()
+    return str(tool.get("name", "")).strip()
+
+
+def responses_named_tools(tools: Sequence[Mapping[str, Any]] | None) -> list[Mapping[str, Any]] | None:
+    if not tools:
+        return None
+    named = [tool for tool in tools if isinstance(tool, Mapping) and _response_tool_name(tool)]
+    return named or None
+
+
 def _response_content_to_text(content: Any) -> str:
     if content is None:
         return ""

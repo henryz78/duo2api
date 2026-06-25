@@ -1,5 +1,6 @@
 import unittest
 
+import responses_api
 from responses_api import (
     build_responses_prompt,
     response_function_call_sse,
@@ -8,6 +9,26 @@ from responses_api import (
 
 
 class ResponsesApiTests(unittest.TestCase):
+    def test_responses_named_tools_keeps_only_tools_with_names(self):
+        helper = getattr(responses_api, "responses_named_tools", None)
+        self.assertIsNotNone(helper)
+        named_tool = {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            },
+        }
+
+        self.assertEqual(
+            helper([
+                {"type": "computer_use_preview"},
+                {"type": "function", "function": {}},
+                named_tool,
+            ]),
+            [named_tool],
+        )
+
     def test_responses_input_to_messages_preserves_task_and_tool_output(self):
         messages = responses_input_to_messages([
             {"type": "message", "role": "developer", "content": "Follow safety rules."},

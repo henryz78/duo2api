@@ -43,6 +43,7 @@ from responses_api import (
     response_completed_sse,
     response_created_sse,
     response_function_call_sse,
+    responses_named_tools,
     responses_input_to_messages,
     sse_event,
     text_output_items,
@@ -587,8 +588,9 @@ async def responses(request: Request, body: ResponsesRequest):
     if err := _check_auth(request):
         return err
 
+    named_tools = responses_named_tools(body.tools)
     try:
-        validate_tools(body.tools)
+        validate_tools(named_tools)
     except ValueError as e:
         return _openai_error(400, "invalid_request_error", str(e), param="tools")
 
@@ -604,6 +606,10 @@ async def responses(request: Request, body: ResponsesRequest):
         )
     upstream_model = resolve_gitlab_model_id(model, models)
     body_data = body.model_dump(exclude_none=True)
+    if named_tools is None:
+        body_data.pop("tools", None)
+    else:
+        body_data["tools"] = named_tools
     try:
         prompt = build_responses_prompt(body_data)
     except ValueError as e:
@@ -611,7 +617,7 @@ async def responses(request: Request, body: ResponsesRequest):
 
     prompt_tokens = _estimate_tokens(prompt)
     resp_id = f"resp_{uuid.uuid4().hex}"
-    tools_allowed = _tools_allowed(body.tools, body.tool_choice)
+    tools_allowed = _tools_allowed(named_tools, body.tool_choice)
 
     return StreamingResponse(
         _do_responses_stream(
@@ -622,7 +628,7 @@ async def responses(request: Request, body: ResponsesRequest):
             upstream_model,
             tools_enabled=tools_allowed,
             messages=responses_input_to_messages(body.input),
-            tools=body.tools,
+            tools=named_tools,
             tool_choice=body.tool_choice,
         ),
         media_type="text/event-stream",
