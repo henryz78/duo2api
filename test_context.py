@@ -2,9 +2,12 @@ import unittest
 
 from context import (
     build_prompt,
+    build_tool_retry_prompt,
     extract_tool_calls,
     fingerprint_messages,
     is_known_model,
+    should_retry_auto_tool_choice,
+    validate_tools,
 )
 
 
@@ -78,6 +81,50 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(calls[0]["type"], "function")
         self.assertEqual(calls[0]["function"]["name"], "get_time")
         self.assertEqual(calls[0]["function"]["arguments"], '{"zone":"UTC"}')
+
+    def test_validate_tools_rejects_missing_function_name(self):
+        with self.assertRaisesRegex(ValueError, r"tools\[0\]\.function\.name"):
+            validate_tools([
+                {
+                    "type": "function",
+                    "function": {
+                        "description": "Missing name",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ])
+
+    def test_should_retry_auto_tool_choice_detects_explicit_tool_intent(self):
+        messages = [{"role": "user", "content": "请调用天气工具查询北京天气"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }
+        ]
+
+        self.assertTrue(should_retry_auto_tool_choice(messages, tools, "auto", "北京今天晴。"))
+
+    def test_should_retry_auto_tool_choice_respects_tool_choice_none(self):
+        messages = [{"role": "user", "content": "请调用天气工具查询北京天气"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }
+        ]
+
+        self.assertFalse(should_retry_auto_tool_choice(messages, tools, "none", "北京今天晴。"))
+
+    def test_build_tool_retry_prompt_adds_stronger_json_only_instruction(self):
+        prompt = build_tool_retry_prompt("base prompt")
+
+        self.assertIn("[Tool Retry Instructions]", prompt)
+        self.assertIn("respond only with a JSON object", prompt)
 
     def test_message_fingerprint_is_stable(self):
         messages = [{"role": "user", "content": "hello"}]

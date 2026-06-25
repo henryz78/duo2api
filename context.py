@@ -19,6 +19,34 @@ TOOL_CALLING_INSTRUCTIONS = (
     '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
     "When no tool is needed, answer normally."
 )
+TOOL_RETRY_INSTRUCTIONS = (
+    "You must respond only with a JSON object matching this shape: "
+    '{"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
+    "Choose the best available tool for the user's request. Do not include prose."
+)
+TOOL_INTENT_KEYWORDS = (
+    "调用",
+    "工具",
+    "查询",
+    "搜索",
+    "查找",
+    "换算",
+    "转换",
+    "获取",
+    "读取",
+    "执行",
+    "运行",
+    "call",
+    "tool",
+    "search",
+    "lookup",
+    "query",
+    "convert",
+    "fetch",
+    "read",
+    "run",
+    "execute",
+)
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -51,6 +79,23 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _tool_name(tool: Mapping[str, Any]) -> str:
+    function = tool.get("function")
+    if isinstance(function, Mapping):
+        return str(function.get("name", "")).strip()
+    return str(tool.get("name", "")).strip()
+
+
+def validate_tools(tools: Sequence[Mapping[str, Any]] | None) -> None:
+    if not tools:
+        return
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, Mapping):
+            raise ValueError(f"tools[{index}] must be an object.")
+        if not _tool_name(tool):
+            raise ValueError(f"tools[{index}].function.name is required.")
+
+
 def _tools_prompt(tools: Sequence[Mapping[str, Any]] | None, tool_choice: Any = None) -> str:
     if not tools:
         return ""
@@ -65,6 +110,14 @@ def _tools_prompt(tools: Sequence[Mapping[str, Any]] | None, tool_choice: Any = 
         "[Tool Calling Instructions]",
         TOOL_CALLING_INSTRUCTIONS,
     ])
+
+
+def build_tool_retry_prompt(prompt: str) -> str:
+    return "\n\n".join([
+        prompt.strip(),
+        "[Tool Retry Instructions]",
+        TOOL_RETRY_INSTRUCTIONS,
+    ]).strip()
 
 
 def _normalize_tool_call(call: Mapping[str, Any], index: int) -> dict[str, Any] | None:
@@ -113,6 +166,42 @@ def extract_tool_calls(text: str) -> list[dict[str, Any]]:
         if calls:
             return calls
     return []
+
+
+def _latest_user_text(messages: Sequence[MessageLike]) -> str:
+    for msg in reversed(messages):
+        if str(msg.get("role", "")).strip().lower() != "user":
+            continue
+        return _message_content_to_text(msg.get("content"))
+    return ""
+
+
+def _is_auto_tool_choice(tool_choice: Any) -> bool:
+    return tool_choice is None or tool_choice == "auto"
+
+
+def should_retry_auto_tool_choice(
+    messages: Sequence[MessageLike],
+    tools: Sequence[Mapping[str, Any]] | None,
+    tool_choice: Any,
+    model_text: str,
+) -> bool:
+    if not tools or not _is_auto_tool_choice(tool_choice):
+        return False
+    if extract_tool_calls(model_text):
+        return False
+    latest_user = _latest_user_text(messages).lower()
+    if not latest_user:
+        return False
+    if any(keyword in latest_user for keyword in TOOL_INTENT_KEYWORDS):
+        return True
+    tool_names = [
+        name.lower()
+        for tool in tools
+        for name in [_tool_name(tool)]
+        if name
+    ]
+    return any(name in latest_user for name in tool_names)
 
 
 def build_prompt(

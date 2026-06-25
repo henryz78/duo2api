@@ -11,9 +11,16 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from context import build_prompt, extract_tool_calls, is_known_model
+from context import (
+    build_prompt,
+    build_tool_retry_prompt,
+    extract_tool_calls,
+    is_known_model,
+    should_retry_auto_tool_choice,
+    validate_tools,
+)
 from gitlab_duo_client import (
     ALL_MODELS,
     DuoChat,
@@ -30,6 +37,15 @@ from security import (
     estimate_tokens,
     public_config_status,
     public_upstream_error_message,
+)
+from responses_api import (
+    build_responses_prompt,
+    response_completed_sse,
+    response_created_sse,
+    response_function_call_sse,
+    responses_input_to_messages,
+    sse_event,
+    text_output_items,
 )
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -94,10 +110,27 @@ class ChatRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
 
 
+class ResponsesRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str = "claude-sonnet-4.5"
+    input: Any
+    stream: bool = True
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    temperature: float | None = None
+    max_output_tokens: int | None = None
+    instructions: str | None = None
+
+
+def _tools_allowed(tools: list[dict[str, Any]] | None, tool_choice: str | dict[str, Any] | None) -> bool:
+    return bool(tools) and tool_choice != "none"
+
+
 def _build_prompt(body: ChatRequest) -> str:
     return build_prompt(
         [m.model_dump(exclude_none=True) for m in body.messages],
-        tools=body.tools,
+        tools=body.tools if _tools_allowed(body.tools, body.tool_choice) else None,
         tool_choice=body.tool_choice,
     )
 
@@ -123,6 +156,43 @@ def _chunk_delta(req_id: str, model: str, delta: dict, finish_reason: str | None
 
 def _tool_call_deltas(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"index": index, **tool_call} for index, tool_call in enumerate(tool_calls)]
+
+
+def _chat_messages(body: ChatRequest) -> list[dict[str, Any]]:
+    return [m.model_dump(exclude_none=True) for m in body.messages]
+
+
+def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+async def _send_with_optional_tool_retry(
+    session: DuoChat,
+    prompt: str,
+    upstream_model: str,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> tuple[str, list[dict[str, Any]], int]:
+    full = await session.send(prompt, model=upstream_model)
+    completion_tokens = _estimate_tokens(full)
+    tool_calls = extract_tool_calls(full)
+    if tool_calls:
+        return full, tool_calls, completion_tokens
+    if not should_retry_auto_tool_choice(messages, tools, tool_choice, full):
+        return full, [], completion_tokens
+
+    retry_full = await session.send(build_tool_retry_prompt(prompt), model=upstream_model)
+    completion_tokens += _estimate_tokens(retry_full)
+    retry_tool_calls = extract_tool_calls(retry_full)
+    if retry_tool_calls:
+        return retry_full, retry_tool_calls, completion_tokens
+    return full, [], completion_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -512,10 +582,63 @@ async def update_config(request: Request, body: ConfigUpdate):
     return {"ok": True, "message": "Config saved. Stateless mode uses new GitLab workflow per request."}
 
 
+@app.post("/v1/responses")
+async def responses(request: Request, body: ResponsesRequest):
+    if err := _check_auth(request):
+        return err
+
+    try:
+        validate_tools(body.tools)
+    except ValueError as e:
+        return _openai_error(400, "invalid_request_error", str(e), param="tools")
+
+    cfg = _load_config()
+    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
+    models = await get_available_models()
+    if not is_known_model(model, models):
+        return _openai_error(
+            400,
+            "model_not_found",
+            f"Model '{model}' not found. Call /v1/models for available models.",
+            param="model",
+        )
+    upstream_model = resolve_gitlab_model_id(model, models)
+    body_data = body.model_dump(exclude_none=True)
+    try:
+        prompt = build_responses_prompt(body_data)
+    except ValueError as e:
+        return _openai_error(400, "invalid_request_error", str(e), param="input")
+
+    prompt_tokens = _estimate_tokens(prompt)
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    tools_allowed = _tools_allowed(body.tools, body.tool_choice)
+
+    return StreamingResponse(
+        _do_responses_stream(
+            prompt,
+            resp_id,
+            prompt_tokens,
+            model,
+            upstream_model,
+            tools_enabled=tools_allowed,
+            messages=responses_input_to_messages(body.input),
+            tools=body.tools,
+            tool_choice=body.tool_choice,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, body: ChatRequest):
     if err := _check_auth(request):
         return err
+
+    try:
+        validate_tools(body.tools)
+    except ValueError as e:
+        return _openai_error(400, "invalid_request_error", str(e), param="tools")
 
     try:
         prompt = _build_prompt(body)
@@ -535,50 +658,260 @@ async def chat_completions(request: Request, body: ChatRequest):
     upstream_model = resolve_gitlab_model_id(model, models)
     prompt_tokens = _estimate_tokens(prompt)
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
+    tools_allowed = _tools_allowed(body.tools, body.tool_choice)
+    messages = _chat_messages(body)
 
     if body.stream:
         return StreamingResponse(
-            _do_stream(prompt, req_id, prompt_tokens, model, upstream_model, tools_enabled=bool(body.tools)),
+            _do_stream(
+                prompt,
+                req_id,
+                prompt_tokens,
+                model,
+                upstream_model,
+                tools_enabled=tools_allowed,
+                messages=messages,
+                tools=body.tools,
+                tool_choice=body.tool_choice,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return await _do_complete(prompt, req_id, prompt_tokens, model, upstream_model, tools_enabled=bool(body.tools))
+    return await _do_complete(
+        prompt,
+        req_id,
+        prompt_tokens,
+        model,
+        upstream_model,
+        tools_enabled=tools_allowed,
+        messages=messages,
+        tools=body.tools,
+        tool_choice=body.tool_choice,
+    )
 
 
-async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str, upstream_model: str, *, tools_enabled: bool = False):
+async def _do_complete(
+    prompt: str,
+    req_id: str,
+    prompt_tokens: int,
+    model: str,
+    upstream_model: str,
+    *,
+    tools_enabled: bool = False,
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+):
     session = DuoChat()
     try:
-        full = await session.send(prompt, model=upstream_model)
+        if tools_enabled:
+            full, tool_calls, completion_tokens = await _send_with_optional_tool_retry(
+                session,
+                prompt,
+                upstream_model,
+                messages=messages or [],
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        else:
+            full = await session.send(prompt, model=upstream_model)
+            completion_tokens = _estimate_tokens(full)
+            tool_calls = []
     except Exception as e:
         logger.warning("GitLab Duo upstream error: %s", e)
         return _openai_error(502, "upstream_error", public_upstream_error_message(e))
     finally:
         await session.close()
 
-    completion_tokens = _estimate_tokens(full)
-    tool_calls = extract_tool_calls(full) if tools_enabled else []
     if tool_calls:
         return JSONResponse(content={
             "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
                                                  "tool_calls": tool_calls},
                          "finish_reason": "tool_calls", "logprobs": None}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                      "total_tokens": prompt_tokens + completion_tokens},
+            "usage": _usage(prompt_tokens, completion_tokens),
             "system_fingerprint": None,
         })
     return JSONResponse(content={
         "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": full},
                      "finish_reason": "stop", "logprobs": None}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                  "total_tokens": prompt_tokens + completion_tokens},
+        "usage": _usage(prompt_tokens, completion_tokens),
         "system_fingerprint": None,
     })
 
 
-async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, upstream_model: str, *, tools_enabled: bool = False):
+def _responses_usage(input_tokens: int, output_tokens: int) -> dict[str, int]:
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+async def _do_responses_stream(
+    prompt: str,
+    resp_id: str,
+    prompt_tokens: int,
+    model: str,
+    upstream_model: str,
+    *,
+    tools_enabled: bool = False,
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+):
+    created_at = int(time.time())
+    yield response_created_sse(resp_id, model, created_at)
+
+    session = DuoChat()
+    if tools_enabled:
+        try:
+            full, tool_calls, completion_tokens = await _send_with_optional_tool_retry(
+                session,
+                prompt,
+                upstream_model,
+                messages=messages or [],
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        except Exception as e:
+            logger.warning("GitLab Duo upstream responses error: %s", e)
+            yield sse_event("response.failed", {
+                "type": "response.failed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "created_at": created_at,
+                    "status": "failed",
+                    "model": model,
+                    "error": {
+                        "code": "upstream_error",
+                        "message": public_upstream_error_message(e),
+                    },
+                },
+            })
+            return
+        finally:
+            await session.close()
+
+        usage = _responses_usage(prompt_tokens, completion_tokens)
+        if tool_calls:
+            yield response_function_call_sse(resp_id, model, created_at, tool_calls[0], usage)
+            return
+
+        message_id = f"msg_{uuid.uuid4().hex[:16]}"
+        added_item, done_item = text_output_items(message_id, full)
+        yield sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": added_item,
+        })
+        yield sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": full,
+        })
+        yield sse_event("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": done_item,
+        })
+        yield response_completed_sse(resp_id, model, created_at, [done_item], usage)
+        return
+
+    message_id = f"msg_{uuid.uuid4().hex[:16]}"
+    added_item, _ = text_output_items(message_id, "")
+    yield sse_event("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": added_item,
+    })
+    yield sse_event("response.content_part.added", {
+        "type": "response.content_part.added",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": ""},
+    })
+
+    full = ""
+    completion_tokens = 0
+    try:
+        async for chunk in session.stream(prompt, model=upstream_model):
+            full += chunk
+            completion_tokens += _estimate_tokens(chunk)
+            yield sse_event("response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": chunk,
+            })
+    except Exception as e:
+        logger.warning("GitLab Duo upstream responses stream error: %s", e)
+        yield sse_event("response.failed", {
+            "type": "response.failed",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "failed",
+                "model": model,
+                "error": {
+                    "code": "upstream_error",
+                    "message": public_upstream_error_message(e),
+                },
+            },
+        })
+        return
+    finally:
+        await session.close()
+
+    _, done_item = text_output_items(message_id, full)
+    yield sse_event("response.output_text.done", {
+        "type": "response.output_text.done",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": full,
+    })
+    yield sse_event("response.content_part.done", {
+        "type": "response.content_part.done",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": full},
+    })
+    yield sse_event("response.output_item.done", {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": done_item,
+    })
+    yield response_completed_sse(
+        resp_id,
+        model,
+        created_at,
+        [done_item],
+        _responses_usage(prompt_tokens, completion_tokens),
+    )
+
+
+async def _do_stream(
+    prompt: str,
+    req_id: str,
+    prompt_tokens: int,
+    model: str,
+    upstream_model: str,
+    *,
+    tools_enabled: bool = False,
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+):
     session = DuoChat()
 
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -588,7 +921,14 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, u
     completion_tokens = 0
     if tools_enabled:
         try:
-            full = await session.send(prompt, model=upstream_model)
+            full, tool_calls, completion_tokens = await _send_with_optional_tool_retry(
+                session,
+                prompt,
+                upstream_model,
+                messages=messages or [],
+                tools=tools,
+                tool_choice=tool_choice,
+            )
         except Exception as e:
             logger.warning("GitLab Duo upstream stream error: %s", e)
             yield _sse({"error": {"message": public_upstream_error_message(e), "type": "server_error", "code": "upstream_error"}})
@@ -597,15 +937,12 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, u
         finally:
             await session.close()
 
-        completion_tokens = _estimate_tokens(full)
-        tool_calls = extract_tool_calls(full)
         if tool_calls:
             yield _chunk_delta(req_id, model, {"tool_calls": _tool_call_deltas(tool_calls)})
             yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
                         "model": model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                                  "total_tokens": prompt_tokens + completion_tokens}})
+                        "usage": _usage(prompt_tokens, completion_tokens)})
             yield "data: [DONE]\n\n"
             return
         if full:
@@ -613,8 +950,7 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, u
         yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
                     "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                              "total_tokens": prompt_tokens + completion_tokens}})
+                    "usage": _usage(prompt_tokens, completion_tokens)})
         yield "data: [DONE]\n\n"
         return
 
@@ -633,8 +969,7 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, u
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
                 "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                          "total_tokens": prompt_tokens + completion_tokens}})
+                "usage": _usage(prompt_tokens, completion_tokens)})
     yield "data: [DONE]\n\n"
 
 
