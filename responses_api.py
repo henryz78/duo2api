@@ -92,7 +92,15 @@ def responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         elif item_type == "function_call_output":
             output = _response_content_to_text(item.get("output"))
             call_id = str(item.get("call_id") or "").strip()
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+            header = f"Previous local tool call {call_id} completed." if call_id else "Previous local tool call completed."
+            content = "\n".join([
+                header,
+                "Tool output:",
+                output or "(no output)",
+                "Continue the original user request from this state.",
+                "Do not repeat completed tool calls; use the next required tool call or provide the final answer.",
+            ])
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
     return messages
 
 

@@ -55,7 +55,46 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertEqual(messages[0], {"role": "system", "content": "Follow safety rules."})
         self.assertEqual(messages[1], {"role": "user", "content": "Create hello.py"})
         self.assertEqual(messages[2]["tool_calls"][0]["function"]["name"], "exec_command")
-        self.assertEqual(messages[3], {"role": "tool", "tool_call_id": "call_123", "content": "hello.py"})
+        self.assertEqual(messages[3]["role"], "tool")
+        self.assertEqual(messages[3]["tool_call_id"], "call_123")
+        self.assertIn("Previous local tool call call_123 completed.", messages[3]["content"])
+        self.assertIn("hello.py", messages[3]["content"])
+        self.assertIn("Continue the original user request", messages[3]["content"])
+        self.assertIn("Do not repeat completed tool calls", messages[3]["content"])
+
+    def test_build_responses_prompt_tells_model_to_continue_after_tool_output(self):
+        prompt = build_responses_prompt({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "Create hello.py containing print(\"CODEX_GPT55_OK\"), then run it.",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "exec_command",
+                    "arguments": '{"command":"write hello.py"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "hello.py created successfully",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "exec_command", "parameters": {"type": "object"}},
+                }
+            ],
+            "tool_choice": "required",
+        })
+
+        self.assertIn("[Tool Result call_123]", prompt)
+        self.assertIn("Previous local tool call call_123 completed.", prompt)
+        self.assertIn("Continue the original user request", prompt)
+        self.assertIn("Do not repeat completed tool calls", prompt)
 
     def test_build_responses_prompt_includes_exec_command_tool(self):
         prompt = build_responses_prompt({
