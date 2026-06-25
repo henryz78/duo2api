@@ -46,6 +46,7 @@ from responses_api import (
     response_completed_sse,
     response_created_sse,
     response_function_call_sse,
+    response_text_for_repeated_completed_tool_call,
     responses_body_to_messages,
     responses_named_tools,
     sse_event,
@@ -818,11 +819,35 @@ async def _do_responses_stream(
 
         usage = _responses_usage(prompt_tokens, completion_tokens)
         if tool_calls:
+            tool_call = normalize_tool_call_for_response(tool_calls[0], tools, messages)
+            repeated_text = response_text_for_repeated_completed_tool_call(tool_call, messages)
+            if repeated_text:
+                message_id = f"msg_{uuid.uuid4().hex[:16]}"
+                added_item, done_item = text_output_items(message_id, repeated_text)
+                yield sse_event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": added_item,
+                })
+                yield sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": repeated_text,
+                })
+                yield sse_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": done_item,
+                })
+                yield response_completed_sse(resp_id, model, created_at, [done_item], usage)
+                return
             yield response_function_call_sse(
                 resp_id,
                 model,
                 created_at,
-                normalize_tool_call_for_response(tool_calls[0], tools, messages),
+                tool_call,
                 usage,
             )
             return

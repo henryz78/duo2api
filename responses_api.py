@@ -16,6 +16,20 @@ _REMAINING_PYTHON_RUN_RE = re.compile(
     r"Remaining task:\s*run\s+([A-Za-z0-9_.\\/.-]+\.py)\s+with Python",
     re.IGNORECASE,
 )
+_TOOL_OUTPUT_STOP_MARKERS = (
+    "Continue the original user request from this state.",
+    "Do not repeat completed tool calls",
+    "Completed step:",
+    "Remaining task:",
+    "Do not recreate or rewrite",
+)
+_FAILED_OUTPUT_MARKERS = (
+    "traceback",
+    "error",
+    "failed",
+    "exit code 1",
+    "returncode: 1",
+)
 
 
 def _response_tool_name(tool: Mapping[str, Any]) -> str:
@@ -121,6 +135,16 @@ def _with_tool_call_arguments(tool_call: Mapping[str, Any], arguments: Mapping[s
     return normalized
 
 
+def _exec_command_text(tool_call: Mapping[str, Any]) -> str:
+    function = tool_call.get("function")
+    if not isinstance(function, Mapping) or function.get("name") != "exec_command":
+        return ""
+    arguments = _tool_call_arguments_dict(tool_call)
+    if arguments is None:
+        return ""
+    return str(arguments.get("cmd") or arguments.get("command") or "").strip()
+
+
 def _remaining_python_run_file(messages: Sequence[Mapping[str, Any]] | None) -> str:
     for message in reversed(messages or []):
         if not isinstance(message, Mapping):
@@ -170,6 +194,55 @@ def normalize_tool_call_for_response(
     if command_key == "cmd":
         arguments.pop("command", None)
     return _with_tool_call_arguments(normalized, arguments)
+
+
+def _completed_tool_output(content: Any) -> str:
+    text = _response_content_to_text(content)
+    if not text or "Tool output:" not in text:
+        return ""
+    output = text.split("Tool output:", 1)[1].strip()
+    for marker in _TOOL_OUTPUT_STOP_MARKERS:
+        if marker in output:
+            output = output.split(marker, 1)[0].strip()
+    if not output or output == "(no output)":
+        return ""
+    output_lower = output.lower()
+    if any(marker in output_lower for marker in _FAILED_OUTPUT_MARKERS):
+        return ""
+    return output
+
+
+def response_text_for_repeated_completed_tool_call(
+    tool_call: Mapping[str, Any],
+    messages: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    command = _exec_command_text(tool_call)
+    if not command:
+        return ""
+
+    matching_call_ids: set[str] = set()
+    completed_outputs: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role", "")).lower() == "assistant":
+            for previous_call in message.get("tool_calls") or []:
+                if not isinstance(previous_call, Mapping):
+                    continue
+                if _exec_command_text(previous_call) == command:
+                    call_id = str(previous_call.get("id") or "").strip()
+                    if call_id:
+                        matching_call_ids.add(call_id)
+        if str(message.get("role", "")).lower() == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if call_id and call_id in matching_call_ids:
+                output = _completed_tool_output(message.get("content"))
+                if output:
+                    completed_outputs.append(output)
+
+    if not completed_outputs:
+        return ""
+    return "Command already completed successfully.\n\nOutput:\n" + completed_outputs[-1]
 
 
 def _response_content_to_text(content: Any) -> str:

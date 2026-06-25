@@ -7,6 +7,7 @@ from responses_api import (
     normalize_tool_call_for_response,
     normalize_tool_call_for_response_tools,
     response_function_call_sse,
+    response_text_for_repeated_completed_tool_call,
     responses_input_to_messages,
 )
 
@@ -222,6 +223,45 @@ class ResponsesApiTests(unittest.TestCase):
         arguments = json.loads(normalized["function"]["arguments"])
 
         self.assertEqual(arguments, {"cmd": "python3 hello.py"})
+
+    def test_repeated_completed_tool_call_returns_final_text(self):
+        tool_call = {
+            "id": "call_next",
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "arguments": '{"cmd":"python3 hello.py"}',
+            },
+        }
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"python3 hello.py"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_0",
+                "content": "\n".join([
+                    "Previous local tool call call_0 completed.",
+                    "Tool output:",
+                    "CODEX_GPT55_OK",
+                    "Continue the original user request from this state.",
+                ]),
+            },
+        ]
+
+        text = response_text_for_repeated_completed_tool_call(tool_call, messages)
+
+        self.assertIn("CODEX_GPT55_OK", text)
+        self.assertIn("completed", text.lower())
 
 
 if __name__ == "__main__":
