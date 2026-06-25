@@ -179,4 +179,11 @@ def fingerprint_messages(messages: Sequence[MessageLike]) -> str:
 def is_known_model(model_id: str, models: Sequence[ModelLike]) -> bool:
     if not model_id:
         return False
-    return any(model_id in (model.get("id"), model.get("gitlab_id")) for model in models)
+    for model in models:
+        aliases = model.get("aliases", [])
+        values = {model.get("id"), model.get("gitlab_id")}
+        if isinstance(aliases, Sequence) and not isinstance(aliases, str):
+            values.update(aliases)
+        if model_id in values:
+            return True
+    return False

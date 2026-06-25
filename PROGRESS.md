@@ -12,10 +12,11 @@
 
 ---
 
-## 当前运行状态（截至 2026-06-24）
+## 当前运行状态（截至 2026-06-25）
 
 - ✅ FastAPI 服务运行在 Replit，端口 8000
-- ✅ 18 个模型全部列出，ID 使用人类友好格式（破折号+点号）
+- ✅ 模型列表通过 GitLab GraphQL 动态获取，当前账号探测到 31 个 selectable models
+- ✅ 模型 ID 兼容破折号 ID、GitLab 下划线 ID、GraphQL 完整 ref
 - ✅ 流式输出（SSE）和非流式均可用
 - ✅ API Key 鉴权（`Authorization: Bearer <key>`）
 - ✅ 管理接口鉴权：`/v1/config` 读写必须使用已配置的 API Key
@@ -58,6 +59,7 @@ pip install fastapi uvicorn httpx websockets
 
 ```
 gitlab_duo_client.py   # WebSocket 客户端 + 模型映射
+model_catalog.py       # GitLab GraphQL 模型归一化 + alias 解析
 server.py              # FastAPI 路由
 context.py             # OpenAI messages 转 prompt
 security.py            # 鉴权、脱敏、配置保护 helper
@@ -115,10 +117,19 @@ https://gitlab.com/api/v4/namespaces?search=<你的群组名>
 ```
 找 `"kind": "group"` 的那条，取其 `id`。
 
-### 坑 2：WebSocket URL 里的模型 ID 是下划线格式
+### 坑 2：网页端模型列表来自 GraphQL
 
-GitLab 内部 API 用 `claude_sonnet_4_5`，但对外 OpenAI 接口我们改成了 `claude-sonnet-4.5`。
-两套 ID 在 `gitlab_duo_client.py` 里用 `_MODEL_ID_MAP` 双向映射，`resolve_gitlab_model_id()` 做转换。
+GitLab 网页端通过 `/api/graphql` 的 `aiChatAvailableModels` 获取当前账号可用模型：
+
+```graphql
+aiChatAvailableModels(rootNamespaceId, namespaceId) {
+  selectableModels { ref name modelProvider modelDescription costIndicator }
+  defaultModel { name ref modelProvider }
+  pinnedModel { ref name }
+}
+```
+
+`ref` 可直接作为 WebSocket URL 里的 `user_selected_model_identifier`。服务对外保留 `claude-sonnet-4.5` 这类 OpenAI-friendly ID，同时接受 GitLab 下划线 ID 和 GraphQL 完整 ref。
 
 ### 坑 3：config.json 路径在 Replit pnpm 工作区里比较深
 
@@ -140,27 +151,19 @@ GitLab Duo 的 WebSocket 握手流程：
 
 ---
 
-## 模型列表（18 个）
+## 模型列表
 
-| 用户友好 ID | GitLab 内部 ID | 提供商 |
-|-------------|----------------|--------|
-| claude-haiku-4.5 | claude_haiku_4_5 | Anthropic |
-| claude-sonnet-4.5 | claude_sonnet_4_5 | Anthropic |
-| claude-sonnet-4.6 | claude_sonnet_4_6 | Anthropic |
-| claude-opus-4.5 | claude_opus_4_5 | Anthropic |
-| claude-opus-4.6 | claude_opus_4_6 | Anthropic |
-| claude-opus-4.7 | claude_opus_4_7 | Anthropic |
-| claude-opus-4.8 | claude_opus_4_8 | Anthropic |
-| gemini-3.5-flash | gemini_3_5_flash | Google |
-| gpt-5-mini | gpt_5_mini | OpenAI |
-| gpt-5.1 | gpt_5_1 | OpenAI |
-| gpt-5.2 | gpt_5_2 | OpenAI |
-| gpt-5-codex | gpt_5_codex | OpenAI |
-| gpt-5.2-codex | gpt_5_2_codex | OpenAI |
-| gpt-5.3-codex | gpt_5_3_codex | OpenAI |
-| gpt-5.4 | gpt_5_4 | OpenAI |
-| gpt-5.4-mini | gpt_5_4_mini | OpenAI |
-| gpt-5.4-nano | gpt_5_4_nano | OpenAI |
+`/v1/models` 会优先查询 GitLab GraphQL `aiChatAvailableModels`，把当前账号返回的 `selectableModels` 转成 OpenAI-compatible 列表。结果缓存 5 分钟，GraphQL 失败时使用内置 `ALL_MODELS` fallback。
+
+当前探测账号返回 31 个模型，包含 Anthropic、Vertex、Bedrock、OpenAI 等 provider 变体。典型返回：
+
+| 用户友好 ID | GitLab ref | Provider |
+|-------------|------------|----------|
+| claude-haiku-4.5 | claude_haiku_4_5_20251001 | Anthropic |
+| claude-haiku-4.5-vertex | claude_haiku_4_5_20251001_vertex | Vertex |
+| claude-haiku-4.5-bedrock | claude_haiku_4_5_20251001_bedrock | Bedrock |
+| claude-sonnet-4.6-vertex | claude_sonnet_4_6_vertex | Vertex |
+| gpt-5.1 | gpt_5 | OpenAI |
 | gpt-5.5 | gpt_5_5 | OpenAI |
 
 ---
@@ -211,6 +214,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [x] **多 session 并发**：每个请求用独立 DuoChat 实例，支持并行对话
 - [x] **对话历史**：把 messages 数组拼成多轮对话传给 Duo
 - [x] **模型校验**：未知模型 ID 返回 OpenAI 风格 400 错误
+- [x] **动态模型列表**：通过 GitLab GraphQL 获取当前账号可用模型，失败时使用 fallback
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
 - [ ] **Docker 部署**：提供 Dockerfile，方便自托管
 
@@ -226,8 +230,9 @@ curl https://<your-replit-domain>/v1/chat/completions \
 
 ```bash
 python -m unittest test_context.py
+python -m unittest test_models.py
 python -m unittest test_security.py
-python -m py_compile context.py security.py server.py gitlab_duo_client.py test_context.py test_security.py
+python -m py_compile context.py model_catalog.py security.py server.py gitlab_duo_client.py test_context.py test_models.py test_security.py
 ```
 
 期望结果：
@@ -489,6 +494,49 @@ curl http://localhost:8000/v1/chat/completions \
 
 期望肉眼结果：SSE 里出现 `delta.tool_calls`，结束帧 `finish_reason` 为 `tool_calls`，最后是 `data: [DONE]`。
 
+### 9. 验证动态模型列表
+
+获取模型列表：
+
+```bash
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+期望肉眼结果：
+- `data` 数量优先接近 GitLab GraphQL 返回的账号可用模型数，当前探测账号为 31 个
+- 返回项包含 `id`、`gitlab_id`、`name`、`model_provider`、`cost_indicator`
+- `claude-sonnet-4.6-vertex` 这类 provider 变体会出现
+- `gpt-5.1` 的 `gitlab_id` 应为 `gpt_5`
+
+用动态模型发起聊天：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.6-vertex",
+    "messages": [{"role": "user", "content": "只回答 OK"}]
+  }'
+```
+
+期望肉眼结果：HTTP 200，响应 `model` 回显 `claude-sonnet-4.6-vertex`，内容能正常返回。
+
+验证 alias 兼容：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-custom-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude_sonnet_4_6_vertex",
+    "messages": [{"role": "user", "content": "只回答 OK"}]
+  }'
+```
+
+期望肉眼结果：HTTP 200，说明 GraphQL 完整 ref / GitLab 下划线 ID 可以被解析。
+
 ---
 
 ## 文件结构
@@ -497,12 +545,14 @@ curl http://localhost:8000/v1/chat/completions \
 .
 ├── context.py                 # OpenAI messages 转 prompt
 ├── gitlab_duo_client.py       # WebSocket 客户端核心逻辑
+├── model_catalog.py           # 动态模型列表归一化与 alias 解析
 ├── security.py                # 鉴权、脱敏、配置保护 helper
 ├── server.py                  # FastAPI 入口
 ├── config.example.json        # 配置模板
 ├── config.json                # 本地运行凭据（gitignore）
 ├── requirements.txt           # Python 依赖
 ├── test_context.py            # 上下文测试
+├── test_models.py             # 模型列表测试
 ├── test_security.py           # 安全测试
 └── PROGRESS.md                # 本文件
 ```

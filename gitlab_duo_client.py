@@ -1,9 +1,14 @@
 import asyncio
 import json
 import re
+import time
 import httpx
 import websockets
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
+
+from model_catalog import normalize_graphql_models, resolve_model_id
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -40,6 +45,30 @@ HTTP_TIMEOUT_SECONDS = 30.0
 WS_OPEN_TIMEOUT_SECONDS = 10.0
 WS_CLOSE_TIMEOUT_SECONDS = 5.0
 RESPONSE_TIMEOUT_SECONDS = 120.0
+MODEL_CACHE_TTL_SECONDS = 300.0
+AI_CHAT_MODELS_QUERY = """
+query getAiChatAvailableModels($rootNamespaceId: GroupID, $namespaceId: GroupID) {
+  aiChatAvailableModels(rootNamespaceId: $rootNamespaceId, namespaceId: $namespaceId) {
+    selectableModels {
+      ref
+      name
+      modelProvider
+      modelDescription
+      costIndicator
+    }
+    defaultModel {
+      name
+      ref
+      modelProvider
+    }
+    pinnedModel {
+      ref
+      name
+    }
+  }
+}
+"""
+_MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "models": None}
 
 # id        = user-facing OpenAI-compatible model ID (dashes + dots)
 # gitlab_id = internal GitLab identifier sent in the WebSocket URL (snake_case)
@@ -70,8 +99,10 @@ _MODEL_ID_MAP: dict[str, str] = {m["id"]: m["gitlab_id"] for m in ALL_MODELS}
 _MODEL_ID_MAP.update({m["gitlab_id"]: m["gitlab_id"] for m in ALL_MODELS})
 
 
-def resolve_gitlab_model_id(model_id: str) -> str:
+def resolve_gitlab_model_id(model_id: str, models: Sequence[dict[str, Any]] | None = None) -> str:
     """Convert user-facing model ID to GitLab internal ID."""
+    if models is not None:
+        return resolve_model_id(model_id, models)
     return _MODEL_ID_MAP.get(model_id, model_id)
 
 
@@ -92,6 +123,67 @@ async def fetch_csrf_token(client: httpx.AsyncClient) -> str:
         if m:
             return m.group(1)
     raise RuntimeError("Could not find CSRF token — are the cookies still valid?")
+
+
+def _namespace_gid() -> str:
+    return f"gid://gitlab/Group/{_get_namespace_id()}"
+
+
+async def fetch_available_models(client: httpx.AsyncClient, csrf: str | None = None) -> list[dict[str, Any]]:
+    ua = _get_ua()
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": cookie_header(),
+        "User-Agent": ua,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
+    namespace_gid = _namespace_gid()
+    resp = await client.post(
+        f"{GITLAB_HOST}/api/graphql",
+        json={
+            "query": AI_CHAT_MODELS_QUERY.strip(),
+            "variables": {
+                "rootNamespaceId": namespace_gid,
+                "namespaceId": namespace_gid,
+            },
+        },
+        headers=headers,
+    )
+    if not resp.is_success:
+        raise RuntimeError(f"Failed to fetch GitLab models ({resp.status_code})")
+    payload = resp.json()
+    result = (payload.get("data") or {}).get("aiChatAvailableModels")
+    if not result:
+        errors = payload.get("errors") or []
+        detail = errors[0].get("message", "empty model list") if errors else "empty model list"
+        raise RuntimeError(f"Failed to fetch GitLab models: {detail}")
+    models = normalize_graphql_models(result)
+    if not models:
+        raise RuntimeError("Failed to fetch GitLab models: empty model list")
+    return models
+
+
+def clear_model_cache() -> None:
+    _MODEL_CACHE["expires_at"] = 0.0
+    _MODEL_CACHE["models"] = None
+
+
+async def get_available_models(*, refresh: bool = False) -> list[dict[str, Any]]:
+    now = time.monotonic()
+    cached = _MODEL_CACHE.get("models")
+    if not refresh and cached is not None and now < float(_MODEL_CACHE.get("expires_at", 0.0)):
+        return list(cached)
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=HTTP_TIMEOUT_SECONDS) as client:
+            csrf = await fetch_csrf_token(client)
+            models = await fetch_available_models(client, csrf)
+    except Exception:
+        return list(ALL_MODELS)
+    _MODEL_CACHE["models"] = list(models)
+    _MODEL_CACHE["expires_at"] = now + MODEL_CACHE_TTL_SECONDS
+    return list(models)
 
 
 async def create_workflow(client: httpx.AsyncClient, csrf: str) -> str:

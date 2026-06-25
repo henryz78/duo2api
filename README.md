@@ -83,7 +83,7 @@ cp config.example.json config.json
   "gitlab": {
     "host": "https://gitlab.com",
     "namespace_id": "你的 namespace_id",
-    "model": "claude_opus_4_8",
+    "model": "claude-opus-4.8",
     "cookies": {
       "_gitlab_session": "粘贴 cookie 值",
       "remember_user_token": "粘贴 cookie 值"
@@ -123,6 +123,8 @@ curl http://localhost:8000/v1/models \
   -H "Authorization: Bearer sk-your-custom-key"
 ```
 
+`/v1/models` 会优先通过 GitLab GraphQL `aiChatAvailableModels` 读取当前账号实际可用模型，结果缓存 5 分钟；GraphQL 请求失败时使用内置 fallback 列表。
+
 ### GET /v1/gitlab/health
 
 ```bash
@@ -141,7 +143,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude_opus_4_8",
+    "model": "claude-opus-4.8",
     "messages": [
       {"role": "system", "content": "你是一个代码专家"},
       {"role": "user", "content": "用 Python 写一个快速排序"}
@@ -179,7 +181,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude_opus_4_8",
+    "model": "claude-opus-4.8",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
@@ -195,7 +197,7 @@ curl http://localhost:8000/v1/chat/completions \
 |---|---|
 | API Base URL | `http://localhost:8000/v1` |
 | API Key | config.json 里设置的 key |
-| 模型 | `claude_opus_4_8` |
+| 模型 | 从 `/v1/models` 返回列表中选择 |
 
 ### Python openai SDK
 
@@ -209,14 +211,14 @@ client = OpenAI(
 
 # 非流式
 resp = client.chat.completions.create(
-    model="claude_opus_4_8",
+    model="claude-opus-4.8",
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
 
 # 流式
 for chunk in client.chat.completions.create(
-    model="claude_opus_4_8",
+    model="claude-opus-4.8",
     messages=[{"role": "user", "content": "你好"}],
     stream=True,
 ):
@@ -235,7 +237,7 @@ for chunk in client.chat.completions.create(
 - **对话历史**：服务每次使用客户端发来的完整 `messages` 作为上下文，不在服务端共享聊天历史。
 - **并发隔离**：每个请求创建独立 GitLab Duo workflow，不同客户端窗口不会通过服务端 session 串台。
 - **System prompt 限制**：GitLab Duo 可能拒绝执行自定义 system-like 指令；普通 user/assistant 历史会正常作为上下文传递。
-- **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`claude_opus_4_8` 需要 GitLab Duo Pro 权限，但目前用户可试用30天。
+- **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`/v1/models` 会按当前账号动态返回可用列表。
 
 ---
 
@@ -248,9 +250,9 @@ for chunk in client.chat.completions.create(
 原项目使用下划线 `claude_sonnet_4_5`，本 fork 改为更通用的格式 `claude-sonnet-4.5`（兼容 OpenAI 官方命名风格）。
 旧格式仍然被接受，会自动映射到对应的 GitLab 内部 ID。
 
-### 2. 完整 18 模型列表
+### 2. 动态模型列表
 
-新增 `ALL_MODELS` 列表，覆盖 Anthropic、Google、OpenAI 三家共 18 个模型，`GET /v1/models` 全部返回。
+`GET /v1/models` 会查询 GitLab 网页端同源 GraphQL 字段 `aiChatAvailableModels`，把 `selectableModels` 转成 OpenAI-compatible 模型列表。模型列表缓存 5 分钟，GitLab 请求失败时使用内置 `ALL_MODELS` 作为 fallback。旧的破折号 ID、GitLab 下划线 ID、GraphQL 完整 `ref` 都会被识别并解析到 GitLab 可用的 `user_selected_model_identifier`。
 
 ### 3. Web 配置界面
 

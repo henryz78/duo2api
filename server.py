@@ -14,7 +14,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from context import build_prompt, extract_tool_calls, is_known_model
-from gitlab_duo_client import ALL_MODELS, DuoChat, _load_config, probe_gitlab_auth
+from gitlab_duo_client import (
+    ALL_MODELS,
+    DuoChat,
+    _load_config,
+    clear_model_cache,
+    get_available_models,
+    probe_gitlab_auth,
+    resolve_gitlab_model_id,
+)
 from security import (
     apply_config_update,
     auth_keys_from_config,
@@ -193,7 +201,7 @@ async def index():
       <div class="row"><span>Chat Completions</span><span class="val">POST /v1/chat/completions</span></div>
       <div class="row"><span>Models</span><span class="val">GET /v1/models</span></div>
       <div class="row"><span>默认模型</span><span class="val" id="default_model_status">待读取</span></div>
-      <div class="row"><span>可用模型数</span><span class="val">{len(ALL_MODELS)} 个</span></div>
+      <div class="row"><span>可用模型数</span><span class="val" id="available_model_count">{len(ALL_MODELS)} 个</span></div>
     </div>
   </div>
 
@@ -227,10 +235,10 @@ async def index():
   </div>
 
   <div class="card">
-    <h2>支持的全部模型（{len(ALL_MODELS)} 个）</h2>
+    <h2>支持的全部模型（<span id="model_table_count">{len(ALL_MODELS)}</span> 个）</h2>
     <table>
       <thead><tr><th>Model ID</th><th>名称</th><th>提供商</th></tr></thead>
-      <tbody>{model_table_rows}</tbody>
+      <tbody id="models_table_body">{model_table_rows}</tbody>
     </table>
   </div>
 
@@ -260,11 +268,47 @@ async def index():
 <script>
 let configLoaded = false;
 
+function escapeHtml(value) {{
+  return String(value || '').replace(/[&<>"']/g, (ch) => ({{
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }}[ch]));
+}}
+
 function authHeaders(includeJson = true) {{
   const key = document.getElementById('admin_key').value.trim();
   const headers = includeJson ? {{'Content-Type': 'application/json'}} : {{}};
   if (key) headers['Authorization'] = 'Bearer ' + key;
   return headers;
+}}
+
+async function loadModels(selectedModel) {{
+  const res = await fetch('/v1/models', {{headers: authHeaders(false)}});
+  if (!res.ok) return;
+  const json = await res.json();
+  const models = json.data || [];
+  const select = document.getElementById('model_input');
+  select.innerHTML = models.map((m) => {{
+    const label = (m.name || m.id) + (m.model_provider ? ' - ' + m.model_provider : '') + (m.cost_indicator ? ' (' + m.cost_indicator + ')' : '');
+    return '<option value="' + escapeHtml(m.id) + '">' + escapeHtml(label) + '</option>';
+  }}).join('');
+  const selected = selectedModel ? models.find((m) => (
+    m.id === selectedModel ||
+    m.gitlab_id === selectedModel ||
+    (m.aliases || []).includes(selectedModel)
+  )) : null;
+  if (selected) {{
+    select.value = selected.id;
+  }}
+  document.getElementById('available_model_count').textContent = models.length + ' 个';
+  document.getElementById('model_table_count').textContent = models.length;
+  document.getElementById('models_table_body').innerHTML = models.map((m) => {{
+    const provider = m.model_provider || m.owned_by || '';
+    return '<tr><td><code>' + escapeHtml(m.id) + '</code></td><td>' + escapeHtml(m.name || m.id) + '</td><td>' + escapeHtml(provider) + '</td></tr>';
+  }}).join('');
 }}
 
 async function loadConfigStatus() {{
@@ -279,6 +323,7 @@ async function loadConfigStatus() {{
   }}
   const cfg = await res.json();
   document.getElementById('namespace_id').value = cfg.namespace_id || '';
+  await loadModels(cfg.model || 'claude-sonnet-4.5');
   document.getElementById('model_input').value = cfg.model || 'claude-sonnet-4.5';
   document.getElementById('default_model_status').textContent = cfg.model || '未配置';
   document.getElementById('gitlab_session').placeholder = cfg.has_session_cookie ? '已配置；留空则保持不变' : '未配置';
@@ -368,13 +413,26 @@ loadConfigStatus().catch(() => {{}});
 async def list_models(request: Request):
     if err := _check_auth(request):
         return err
+    models = await get_available_models()
     ts = int(time.time())
     return {
         "object": "list",
         "data": [
-            {"id": m["id"], "object": "model", "created": ts,
-             "owned_by": m["owned_by"], "permission": [], "root": m["id"], "parent": None}
-            for m in ALL_MODELS
+            {
+                "id": m["id"],
+                "object": "model",
+                "created": ts,
+                "owned_by": m.get("owned_by", "gitlab"),
+                "permission": [],
+                "root": m["id"],
+                "parent": None,
+                "name": m.get("name", m["id"]),
+                "gitlab_id": m.get("gitlab_id", m["id"]),
+                "model_provider": m.get("model_provider", m.get("owned_by", "gitlab")),
+                "cost_indicator": m.get("cost_indicator", ""),
+                "aliases": m.get("aliases", []),
+            }
+            for m in models
         ],
     }
 
@@ -409,7 +467,8 @@ async def get_config(request: Request):
     if err := _check_auth(request, require_configured_keys=True):
         return err
     cfg = _load_config()
-    return public_config_status(cfg, len(ALL_MODELS))
+    models = await get_available_models()
+    return public_config_status(cfg, len(models))
 
 
 class ConfigUpdate(BaseModel):
@@ -425,7 +484,8 @@ async def update_config(request: Request, body: ConfigUpdate):
     if err := _check_auth(request, require_configured_keys=True):
         return err
     cfg = _load_config()
-    if body.model and not is_known_model(body.model, ALL_MODELS):
+    models = await get_available_models()
+    if body.model and not is_known_model(body.model, models):
         return _openai_error(
             400,
             "model_not_found",
@@ -438,7 +498,7 @@ async def update_config(request: Request, body: ConfigUpdate):
             gitlab_session=body.gitlab_session,
             remember_token=body.remember_token,
             namespace_id=body.namespace_id,
-            model=body.model,
+            model=body.model or None,
             api_keys=body.api_keys,
         )
     except ValueError as e:
@@ -448,6 +508,7 @@ async def update_config(request: Request, body: ConfigUpdate):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     clear_auth_cache()
+    clear_model_cache()
     return {"ok": True, "message": "Config saved. Stateless mode uses new GitLab workflow per request."}
 
 
@@ -463,30 +524,32 @@ async def chat_completions(request: Request, body: ChatRequest):
 
     cfg = _load_config()
     model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
-    if not is_known_model(model, ALL_MODELS):
+    models = await get_available_models()
+    if not is_known_model(model, models):
         return _openai_error(
             400,
             "model_not_found",
             f"Model '{model}' not found. Call /v1/models for available models.",
             param="model",
         )
+    upstream_model = resolve_gitlab_model_id(model, models)
     prompt_tokens = _estimate_tokens(prompt)
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
 
     if body.stream:
         return StreamingResponse(
-            _do_stream(prompt, req_id, prompt_tokens, model, tools_enabled=bool(body.tools)),
+            _do_stream(prompt, req_id, prompt_tokens, model, upstream_model, tools_enabled=bool(body.tools)),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return await _do_complete(prompt, req_id, prompt_tokens, model, tools_enabled=bool(body.tools))
+    return await _do_complete(prompt, req_id, prompt_tokens, model, upstream_model, tools_enabled=bool(body.tools))
 
 
-async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str, *, tools_enabled: bool = False):
+async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str, upstream_model: str, *, tools_enabled: bool = False):
     session = DuoChat()
     try:
-        full = await session.send(prompt, model=model)
+        full = await session.send(prompt, model=upstream_model)
     except Exception as e:
         logger.warning("GitLab Duo upstream error: %s", e)
         return _openai_error(502, "upstream_error", public_upstream_error_message(e))
@@ -515,7 +578,7 @@ async def _do_complete(prompt: str, req_id: str, prompt_tokens: int, model: str,
     })
 
 
-async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, *, tools_enabled: bool = False):
+async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, upstream_model: str, *, tools_enabled: bool = False):
     session = DuoChat()
 
     yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -525,7 +588,7 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, *
     completion_tokens = 0
     if tools_enabled:
         try:
-            full = await session.send(prompt, model=model)
+            full = await session.send(prompt, model=upstream_model)
         except Exception as e:
             logger.warning("GitLab Duo upstream stream error: %s", e)
             yield _sse({"error": {"message": public_upstream_error_message(e), "type": "server_error", "code": "upstream_error"}})
@@ -556,7 +619,7 @@ async def _do_stream(prompt: str, req_id: str, prompt_tokens: int, model: str, *
         return
 
     try:
-        async for chunk in session.stream(prompt, model=model):
+        async for chunk in session.stream(prompt, model=upstream_model):
             completion_tokens += _estimate_tokens(chunk)
             yield _chunk(req_id, model, content=chunk)
     except Exception as e:
