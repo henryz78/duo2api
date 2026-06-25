@@ -192,7 +192,15 @@ async def _send_with_optional_tool_retry(
     ):
         return full, [], completion_tokens
 
-    retry_full = await session.send(build_tool_retry_prompt(prompt), model=upstream_model)
+    retry_full = await session.send(
+        build_tool_retry_prompt(
+            prompt,
+            messages=messages,
+            tools=tools,
+            previous_response=full,
+        ),
+        model=upstream_model,
+    )
     completion_tokens += _estimate_tokens(retry_full)
     retry_tool_calls = extract_tool_calls(retry_full)
     if retry_tool_calls:

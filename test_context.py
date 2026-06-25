@@ -158,6 +158,33 @@ class ContextTests(unittest.TestCase):
         self.assertIn("[Tool Retry Instructions]", prompt)
         self.assertIn("respond only with a JSON object", prompt)
 
+    def test_build_tool_retry_prompt_includes_adapter_request_tools_and_previous_response(self):
+        prompt = build_tool_retry_prompt(
+            "base prompt",
+            messages=[{"role": "user", "content": "帮我看看目前系统状态"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "description": "Run a shell command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            previous_response="What local action would you like me to perform?",
+        )
+
+        self.assertIn("[Compatibility Tool Adapter]", prompt)
+        self.assertIn("User request:\n帮我看看目前系统状态", prompt)
+        self.assertIn('"name":"exec_command"', prompt)
+        self.assertIn("Previous invalid response:", prompt)
+        self.assertIn("What local action would you like me to perform?", prompt)
+        self.assertIn('{"tool_calls":[{"name":"exec_command","arguments":{"command":"..."}}]}', prompt)
+
     def test_message_fingerprint_is_stable(self):
         messages = [{"role": "user", "content": "hello"}]
 

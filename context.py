@@ -124,12 +124,71 @@ def _tools_prompt(tools: Sequence[Mapping[str, Any]] | None, tool_choice: Any = 
     ])
 
 
-def build_tool_retry_prompt(prompt: str) -> str:
-    return "\n\n".join([
+def _tools_json(tools: Sequence[Mapping[str, Any]] | None) -> str:
+    return _compact_json(list(tools or []))
+
+
+def build_tool_retry_prompt(
+    prompt: str,
+    *,
+    messages: Sequence[MessageLike] | None = None,
+    tools: Sequence[Mapping[str, Any]] | None = None,
+    previous_response: str = "",
+) -> str:
+    parts = [
         prompt.strip(),
         "[Tool Retry Instructions]",
         TOOL_RETRY_INSTRUCTIONS,
-    ]).strip()
+    ]
+    if messages is not None or tools:
+        request_text = _latest_request_text(messages or [])
+        tools_text = _tools_json(tools)
+        has_exec_command = any(_tool_name(tool) == "exec_command" for tool in (tools or []))
+        schema = (
+            '{"tool_calls":[{"name":"exec_command","arguments":{"command":"..."}}]}'
+            if has_exec_command
+            else '{"tool_calls":[{"name":"tool_name","arguments":{}}]}'
+        )
+        selection = [
+            "Use exec_command for creating files, editing files, reading directories, running Python, "
+            "running shell commands, checking versions, installing packages, or executing tests.",
+            "Use the command field for the exact shell command.",
+            "Prefer a single safe command that performs the requested action.",
+            "If multiple steps are needed, combine them with shell syntax supported by the current OS.",
+        ] if has_exec_command else [
+            "Choose the best matching tool from Available tools.",
+            "Use argument names from the selected tool schema.",
+            "Prefer exactly one tool call for the requested action.",
+        ]
+        adapter = [
+            "[Compatibility Tool Adapter]",
+            "You are producing an OpenAI-compatible tool call for a local automation client.",
+            "Your task is to convert the user's requested local action into exactly one tool call.",
+            "Output rules:",
+            "Output only valid JSON.",
+            "Do not explain.",
+            "Do not describe what you will do.",
+            "Do not answer in prose.",
+            "Do not use markdown.",
+            "The first character must be {.",
+            "The full response must match this schema exactly:",
+            schema,
+            "Tool selection:",
+            *selection,
+            "User request:",
+            request_text,
+            "Available tools:",
+            tools_text,
+        ]
+        previous = previous_response.strip()
+        if previous:
+            adapter.extend([
+                "Previous invalid response:",
+                previous[:2000],
+            ])
+        adapter.append("Return only the JSON tool call now.")
+        parts.append("\n".join(adapter))
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def _normalize_tool_call(call: Mapping[str, Any], index: int) -> dict[str, Any] | None:
