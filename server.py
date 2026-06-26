@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +29,7 @@ from gitlab_duo_client import (
     _load_config,
     clear_model_cache,
     get_available_models,
+    model_cache_status,
     probe_gitlab_auth,
     resolve_gitlab_model_id,
 )
@@ -101,7 +103,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: str = "claude-sonnet-4.5"
+    model: str = "claude-sonnet-4.6"
     messages: list[Message]
     stream: bool = False
     temperature: float | None = None
@@ -118,7 +120,7 @@ class ChatRequest(BaseModel):
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    model: str = "claude-sonnet-4.5"
+    model: str = "claude-sonnet-4.6"
     input: Any
     stream: bool = True
     tools: list[dict[str, Any]] | None = None
@@ -175,6 +177,58 @@ def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
     }
 
 
+def _git_metadata(args: list[str], fallback_env: str) -> str:
+    value = os.environ.get(fallback_env, "").strip()
+    if value:
+        return value
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _version_status() -> dict[str, str]:
+    return {
+        "commit": _git_metadata(["rev-parse", "--short", "HEAD"], "DUO2API_COMMIT"),
+        "branch": _git_metadata(["branch", "--show-current"], "DUO2API_BRANCH"),
+    }
+
+
+def _local_status_payload(cfg: dict[str, Any]) -> dict[str, Any]:
+    gitlab_cfg = cfg.get("gitlab", {}) if isinstance(cfg, dict) else {}
+    server_cfg = cfg.get("server", {}) if isinstance(cfg, dict) else {}
+    cookies = gitlab_cfg.get("cookies", {}) if isinstance(gitlab_cfg, dict) else {}
+    api_keys = server_cfg.get("api_keys", []) if isinstance(server_cfg, dict) else []
+    return {
+        "ok": True,
+        "service": "duo2api",
+        "version": _version_status(),
+        "features": {
+            "chat_completions": True,
+            "chat_tools": True,
+            "responses_api": True,
+            "codex_cli": True,
+            "dynamic_models": True,
+            "duo_tool_bridge": ["create_file_with_contents", "run_command"],
+            "unknown_duo_tool_diagnostics": True,
+        },
+        "config": {
+            "has_namespace_id": bool(str(gitlab_cfg.get("namespace_id", "")).strip()),
+            "has_session_cookie": bool(str(cookies.get("_gitlab_session", "")).strip()),
+            "has_remember_token": bool(str(cookies.get("remember_user_token", "")).strip()),
+            "api_keys_count": len(api_keys) if isinstance(api_keys, list) else 0,
+            "default_model": gitlab_cfg.get("model", "claude-sonnet-4.6"),
+        },
+        "models": model_cache_status(),
+    }
+
+
 async def _send_with_optional_tool_retry(
     session: DuoChat,
     prompt: str,
@@ -218,7 +272,7 @@ async def _send_with_optional_tool_retry(
 @app.get("/", response_class=HTMLResponse)
 async def index():
     model_options = "\n".join(
-        f'<option value="{m["id"]}" {"selected" if m["id"] == "claude-sonnet-4.5" else ""}>{m["name"]} ({m["owned_by"]})</option>'
+        f'<option value="{m["id"]}" {"selected" if m["id"] == "claude-sonnet-4.6" else ""}>{m["name"]} ({m["owned_by"]})</option>'
         for m in ALL_MODELS
     )
 
@@ -285,6 +339,7 @@ async def index():
     <div class="api-info">
       <div class="row"><span>Base URL</span><span class="val">/v1</span></div>
       <div class="row"><span>Chat Completions</span><span class="val">POST /v1/chat/completions</span></div>
+      <div class="row"><span>Status</span><span class="val">GET /v1/status</span></div>
       <div class="row"><span>Models</span><span class="val">GET /v1/models</span></div>
       <div class="row"><span>默认模型</span><span class="val" id="default_model_status">待读取</span></div>
       <div class="row"><span>可用模型数</span><span class="val" id="available_model_count">{len(ALL_MODELS)} 个</span></div>
@@ -409,8 +464,8 @@ async function loadConfigStatus() {{
   }}
   const cfg = await res.json();
   document.getElementById('namespace_id').value = cfg.namespace_id || '';
-  await loadModels(cfg.model || 'claude-sonnet-4.5');
-  document.getElementById('model_input').value = cfg.model || 'claude-sonnet-4.5';
+  await loadModels(cfg.model || 'claude-sonnet-4.6');
+  document.getElementById('model_input').value = cfg.model || 'claude-sonnet-4.6';
   document.getElementById('default_model_status').textContent = cfg.model || '未配置';
   document.getElementById('gitlab_session').placeholder = cfg.has_session_cookie ? '已配置；留空则保持不变' : '未配置';
   document.getElementById('remember_token').placeholder = cfg.has_remember_token ? '已配置；留空则保持不变' : '未配置';
@@ -528,6 +583,31 @@ async def healthz():
     return {"ok": True, "service": "duo2api"}
 
 
+@app.get("/v1/status")
+async def service_status(request: Request, deep: bool = False):
+    if err := _check_auth(request, require_configured_keys=deep):
+        return err
+    payload = _local_status_payload(_load_config())
+    if not deep:
+        return payload
+    try:
+        gitlab = await probe_gitlab_auth(deep=True)
+    except Exception as e:
+        logger.warning("GitLab Duo status deep check failed: %s", e)
+        gitlab = {
+            "ok": False,
+            "gitlab_authenticated": False,
+            "checks": {
+                "csrf_token": False,
+                "workflow": False,
+            },
+            "message": public_upstream_error_message(e),
+        }
+    payload["ok"] = bool(gitlab.get("ok"))
+    payload["gitlab_health"] = gitlab
+    return payload
+
+
 @app.get("/v1/gitlab/health")
 async def gitlab_health(request: Request, deep: bool = False):
     if err := _check_auth(request, require_configured_keys=True):
@@ -610,7 +690,7 @@ async def responses(request: Request, body: ResponsesRequest):
         return _openai_error(400, "invalid_request_error", str(e), param="tools")
 
     cfg = _load_config()
-    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
+    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.6")
     models = await get_available_models()
     if not is_known_model(model, models):
         return _openai_error(
@@ -667,7 +747,7 @@ async def chat_completions(request: Request, body: ChatRequest):
         return _openai_error(400, "invalid_request_error", str(e), param="messages")
 
     cfg = _load_config()
-    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.5")
+    model = body.model if body.model else cfg["gitlab"].get("model", "claude-sonnet-4.6")
     models = await get_available_models()
     if not is_known_model(model, models):
         return _openai_error(

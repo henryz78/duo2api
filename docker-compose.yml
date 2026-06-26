@@ -2,6 +2,9 @@ services:
   duo2api:
     build:
       context: .
+      args:
+        DUO2API_COMMIT: ${DUO2API_COMMIT:-unknown}
+        DUO2API_BRANCH: ${DUO2API_BRANCH:-main}
     container_name: duo2api
     restart: unless-stopped
     ports:

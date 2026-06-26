@@ -29,6 +29,7 @@
 - ✅ `/healthz` 健康检查
 - ✅ `/v1/gitlab/health?deep=true` 主动检测 GitLab Cookie 与 Duo workflow
 - ✅ 上游错误对客户端脱敏，详细信息写服务端日志
+- ✅ `/v1/status` 本地诊断端点，支持 `deep=true` GitLab 鉴权检查
 - ✅ 工具调用兼容层：OpenAI `tools/tool_choice` 通过 prompt 模拟，响应包装为 `tool_calls`
 - ✅ `/v1/responses` 最小 SSE 兼容层，Codex CLI 可连接并执行本地命令
 - ✅ Codex CLI `exec_command(cmd=...)` 参数兼容，`missing field 'cmd'` 已修复
@@ -271,6 +272,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [x] **对话历史**：把 messages 数组拼成多轮对话传给 Duo
 - [x] **模型校验**：未知模型 ID 返回 OpenAI 风格 400 错误
 - [x] **动态模型列表**：通过 GitLab GraphQL 获取当前账号可用模型，失败时使用 fallback
+- [x] **状态诊断端点**：`/v1/status` 返回版本、功能、配置、模型缓存与 GitLab deep health
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
 - [x] **Docker 部署**：提供 Dockerfile 和 docker-compose.yml，方便自托管
 

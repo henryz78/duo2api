@@ -126,6 +126,14 @@ docker compose up -d --build
 docker compose logs -f duo2api
 ```
 
+可选：构建容器时注入版本信息，`/v1/status` 会显示这些值。
+
+```bash
+DUO2API_COMMIT=$(git rev-parse --short HEAD) \
+DUO2API_BRANCH=$(git branch --show-current) \
+docker compose up -d --build
+```
+
 启动后用下面两条命令验证服务和 GitLab 鉴权：
 
 ```bash
@@ -163,6 +171,24 @@ curl http://localhost:8000/v1/models \
 ```
 
 `/v1/models` 会优先通过 GitLab GraphQL `aiChatAvailableModels` 读取当前账号实际可用模型，结果缓存 5 分钟；GraphQL 请求失败时使用内置 fallback 列表。
+
+### GET /v1/status
+
+```bash
+curl http://localhost:8000/v1/status \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+`/v1/status` 返回本地诊断信息：当前 commit/branch、功能开关、配置是否已填、模型缓存状态、fallback 模型数量。轻量模式读取本地配置并秒回。
+
+深度检查：
+
+```bash
+curl "http://localhost:8000/v1/status?deep=true" \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+`deep=true` 会附带 GitLab 鉴权状态，包含 CSRF 与 Duo workflow 检查结果。
 
 ### GET /v1/gitlab/health
 

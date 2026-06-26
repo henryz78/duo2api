@@ -13,6 +13,105 @@ else:
 
 @unittest.skipIf(server is None, f"server dependencies unavailable: {_IMPORT_ERROR}")
 class ServerToolTests(unittest.TestCase):
+    def test_status_light_is_local_and_redacts_secrets(self):
+        called_probe = False
+
+        async def fake_probe(deep=False):
+            nonlocal called_probe
+            called_probe = True
+            return {"ok": True}
+
+        originals = {
+            "_check_auth": server._check_auth,
+            "_load_config": server._load_config,
+            "probe_gitlab_auth": server.probe_gitlab_auth,
+            "_version_status": server._version_status,
+            "model_cache_status": server.model_cache_status,
+        }
+        server._check_auth = lambda request, require_configured_keys=False: None
+        server._load_config = lambda: {
+            "gitlab": {
+                "namespace_id": "135911158",
+                "model": "gpt-5.5",
+                "cookies": {
+                    "_gitlab_session": "secret-session",
+                    "remember_user_token": "",
+                },
+            },
+            "server": {"api_keys": ["sk-secret"]},
+        }
+        server.probe_gitlab_auth = fake_probe
+        server._version_status = lambda: {"commit": "abc123", "branch": "main"}
+        server.model_cache_status = lambda: {
+            "cache_ttl_seconds": 300,
+            "has_cached_models": False,
+            "cached_count": 0,
+            "expires_in_seconds": 0,
+            "fallback_count": 18,
+        }
+        try:
+            payload = asyncio.run(server.service_status(object(), deep=False))
+        finally:
+            for name, original in originals.items():
+                setattr(server, name, original)
+
+        serialized = json.dumps(payload)
+        self.assertFalse(called_probe)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["version"]["commit"], "abc123")
+        self.assertTrue(payload["features"]["responses_api"])
+        self.assertEqual(payload["features"]["duo_tool_bridge"], ["create_file_with_contents", "run_command"])
+        self.assertTrue(payload["config"]["has_namespace_id"])
+        self.assertTrue(payload["config"]["has_session_cookie"])
+        self.assertFalse(payload["config"]["has_remember_token"])
+        self.assertEqual(payload["config"]["api_keys_count"], 1)
+        self.assertEqual(payload["config"]["default_model"], "gpt-5.5")
+        self.assertNotIn("secret-session", serialized)
+        self.assertNotIn("sk-secret", serialized)
+
+    def test_status_deep_includes_gitlab_health(self):
+        seen: dict[str, object] = {}
+
+        async def fake_probe(deep=False):
+            seen["deep"] = deep
+            return {
+                "ok": True,
+                "gitlab_authenticated": True,
+                "checks": {"csrf_token": True, "workflow": True},
+            }
+
+        originals = {
+            "_check_auth": server._check_auth,
+            "_load_config": server._load_config,
+            "probe_gitlab_auth": server.probe_gitlab_auth,
+            "_version_status": server._version_status,
+            "model_cache_status": server.model_cache_status,
+        }
+        server._check_auth = lambda request, require_configured_keys=False: None
+        server._load_config = lambda: {
+            "gitlab": {"namespace_id": "135911158", "model": "gpt-5.5", "cookies": {}},
+            "server": {"api_keys": ["sk-secret"]},
+        }
+        server.probe_gitlab_auth = fake_probe
+        server._version_status = lambda: {"commit": "abc123", "branch": "main"}
+        server.model_cache_status = lambda: {
+            "cache_ttl_seconds": 300,
+            "has_cached_models": False,
+            "cached_count": 0,
+            "expires_in_seconds": 0,
+            "fallback_count": 18,
+        }
+        try:
+            payload = asyncio.run(server.service_status(object(), deep=True))
+        finally:
+            for name, original in originals.items():
+                setattr(server, name, original)
+
+        self.assertTrue(seen["deep"])
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["gitlab_health"]["gitlab_authenticated"])
+        self.assertTrue(payload["gitlab_health"]["checks"]["workflow"])
+
     def test_responses_filters_nameless_tools_before_validation(self):
         captured: dict[str, object] = {}
         named_tool = {

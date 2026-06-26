@@ -32,7 +32,7 @@ def _get_namespace_id() -> str:
 
 
 def _get_model() -> str:
-    return _gitlab_cfg().get("model", "claude-sonnet-4.5")
+    return _gitlab_cfg().get("model", "claude-sonnet-4.6")
 
 
 def _get_ua() -> str:
@@ -41,7 +41,7 @@ def _get_ua() -> str:
 
 GITLAB_HOST = "https://gitlab.com"
 WSS_HOST = "wss://gitlab.com"
-MODEL = "claude-sonnet-4.5"
+MODEL = "claude-sonnet-4.6"
 HTTP_TIMEOUT_SECONDS = 30.0
 WS_OPEN_TIMEOUT_SECONDS = 10.0
 WS_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -169,6 +169,19 @@ async def fetch_available_models(client: httpx.AsyncClient, csrf: str | None = N
 def clear_model_cache() -> None:
     _MODEL_CACHE["expires_at"] = 0.0
     _MODEL_CACHE["models"] = None
+
+
+def model_cache_status() -> dict[str, Any]:
+    cached = _MODEL_CACHE.get("models")
+    expires_at = float(_MODEL_CACHE.get("expires_at", 0.0))
+    expires_in = max(0, int(expires_at - time.monotonic())) if cached is not None else 0
+    return {
+        "cache_ttl_seconds": int(MODEL_CACHE_TTL_SECONDS),
+        "has_cached_models": cached is not None and expires_in > 0,
+        "cached_count": len(cached) if isinstance(cached, list) else 0,
+        "expires_in_seconds": expires_in,
+        "fallback_count": len(ALL_MODELS),
+    }
 
 
 async def get_available_models(*, refresh: bool = False) -> list[dict[str, Any]]:
