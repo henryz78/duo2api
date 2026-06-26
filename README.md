@@ -111,10 +111,19 @@ cp config.example.json config.json
 
 ### 5. 启动服务
 
+本机 Python 启动：
+
 ```bash
 python3 server.py
 # 或
 uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+Docker 启动：
+
+```bash
+docker compose up -d --build
+docker compose logs -f duo2api
 ```
 
 启动后用下面两条命令验证服务和 GitLab 鉴权：
@@ -128,6 +137,23 @@ curl "http://localhost:8000/v1/gitlab/health?deep=true" \
 ---
 
 ## API 接口
+
+### Docker 部署
+
+仓库包含 `Dockerfile` 和 `docker-compose.yml`。Docker 镜像不会包含真实 `config.json`；运行时通过 volume 挂载当前目录的 `config.json` 到容器内 `/app/config.json`。
+
+常用命令：
+
+```bash
+cp config.example.json config.json
+# 编辑 config.json 后启动
+docker compose up -d --build
+docker compose ps
+docker compose logs -f duo2api
+docker compose down
+```
+
+容器健康检查使用 `/healthz`，端口默认映射为 `localhost:8000`。
 
 ### GET /v1/models
 

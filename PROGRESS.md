@@ -37,6 +37,7 @@
 - ✅ 重复成功命令拦截：同一条成功命令不会反复执行
 - ✅ Codex CLI 真实编程任务验收通过：创建文件、运行命令、pytest、修代码、多步任务
 - ✅ 未知 GitLab Duo 原生 `tool_info` 会返回脱敏诊断，只暴露工具名和参数 key
+- ✅ Dockerfile + docker-compose.yml 已提供，支持挂载本地 `config.json` 一键启动
 - 🚧 联网搜索内置提示词尚未实现
 
 ---
@@ -271,7 +272,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [x] **模型校验**：未知模型 ID 返回 OpenAI 风格 400 错误
 - [x] **动态模型列表**：通过 GitLab GraphQL 获取当前账号可用模型，失败时使用 fallback
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
-- [ ] **Docker 部署**：提供 Dockerfile，方便自托管
+- [x] **Docker 部署**：提供 Dockerfile 和 docker-compose.yml，方便自托管
 
 ---
 
@@ -598,7 +599,10 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```
 .
+├── .dockerignore              # Docker build 排除规则
 ├── context.py                 # OpenAI messages 转 prompt
+├── Dockerfile                 # Docker 镜像构建
+├── docker-compose.yml         # 本地容器一键启动
 ├── gitlab_duo_client.py       # WebSocket 客户端核心逻辑
 ├── model_catalog.py           # 动态模型列表归一化与 alias 解析
 ├── responses_api.py           # Responses API / Codex CLI 兼容层
