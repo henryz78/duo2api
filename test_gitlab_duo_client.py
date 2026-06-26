@@ -91,6 +91,30 @@ class GitLabDuoToolApprovalTests(unittest.TestCase):
         command = json.loads(calls[0]["function"]["arguments"])["command"]
         self.assertEqual(command, "bash -lc 'python3 hello.py'")
 
+    def test_recv_until_done_reports_unknown_tool_info_without_argument_values(self):
+        checkpoint = _checkpoint_with_tool({
+            "name": "read_file",
+            "args": {
+                "path": "secret.py",
+                "token": "should-not-leak",
+            },
+        })
+        frame = json.dumps({
+            "newCheckpoint": {
+                "status": "TOOL_CALL_APPROVAL_REQUIRED",
+                "checkpoint": checkpoint,
+            }
+        })
+
+        answer, _, _ = asyncio.run(_recv_until_done(FakeWebSocket([frame]), "wf-1"))
+
+        self.assertIn("Unsupported GitLab Duo tool_info", answer)
+        self.assertIn("read_file", answer)
+        self.assertIn("path", answer)
+        self.assertIn("token", answer)
+        self.assertNotIn("secret.py", answer)
+        self.assertNotIn("should-not-leak", answer)
+
 
 if __name__ == "__main__":
     unittest.main()

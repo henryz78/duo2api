@@ -338,7 +338,11 @@ def _duo_tool_info_to_tool_call_text(tool_info: Mapping[str, Any] | None) -> str
     elif name == "run_command":
         command = _run_command(args)
     else:
-        return None
+        arg_keys = sorted(str(key) for key in args.keys())
+        return (
+            "Unsupported GitLab Duo tool_info received. "
+            f"name={name or 'unknown'} args_keys={json.dumps(arg_keys, ensure_ascii=False)}"
+        )
     if not command:
         return None
     return _exec_command_call(command)
