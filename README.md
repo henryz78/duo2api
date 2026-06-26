@@ -134,6 +134,28 @@ curl "http://localhost:8000/v1/gitlab/health?deep=true" \
 
 `deep=true` 会验证 GitLab Cookie 能获取 CSRF，并创建一次 Duo workflow 来确认 namespace 权限。
 
+### POST /v1/responses
+
+`/v1/responses` 提供 OpenAI Responses API 的最小 SSE 兼容层，主要用于 Codex CLI 这类 agent 客户端。当前已支持：
+
+- `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.completed`
+- Responses 风格 `function_call` SSE
+- Codex CLI 风格 `exec_command(cmd=...)`
+- GitLab Duo 原生 `create_file_with_contents` / `run_command` 到 `exec_command` 的桥接
+- 重复成功命令拦截，避免同一条本地命令反复执行
+
+Codex CLI 推荐模型：
+
+| 等级 | 模型 | 说明 |
+|---|---|---|
+| A | `claude-sonnet-4.6` | 实测最快、POST 次数少、token 消耗低 |
+| A | `gpt-5.5` | 基准模型，真实编程任务稳定 |
+| A | `gpt-5.4-mini` | 成本较低，轻量任务表现好 |
+| B | `gpt-5.4` | 可用，曾出现 shell 转义错误并自动恢复 |
+| B | `claude-sonnet-4.6-vertex` | 可用，偶发 WebSocket reconnect |
+| C | `gemini-3.5-flash` | 可用，轮次和 token 消耗较高 |
+| D | `gpt-5-codex` | Codex CLI metadata 不匹配，当前不推荐 |
+
 ### POST /v1/chat/completions
 
 **非流式：**
@@ -229,6 +251,36 @@ for chunk in client.chat.completions.create(
 
 在设置中将 OpenAI API 地址改为 `http://localhost:8000/v1`，填入 API Key 即可，其余使用方式与官方 OpenAI 完全一致。
 
+### Codex CLI
+
+Codex CLI 需要使用 `/v1/responses`。配置自定义 provider 时，将 base URL 指向：
+
+```text
+http://localhost:8000/v1
+```
+
+推荐模型：
+
+```text
+claude-sonnet-4.6
+gpt-5.5
+gpt-5.4-mini
+```
+
+已验证任务类型：
+
+- 创建文件并运行 Python
+- 多文件 `add.py` + `test_add.py` + pytest
+- 读取失败测试、修复代码、重新运行测试
+- 目录检查与小改动
+- 多步 shell 命令
+
+当前稳定验证点：
+
+```text
+283dd34 fix: stop repeated successful response tools
+```
+
 ---
 
 ## 注意事项
@@ -238,6 +290,8 @@ for chunk in client.chat.completions.create(
 - **并发隔离**：每个请求创建独立 GitLab Duo workflow，不同客户端窗口不会通过服务端 session 串台。
 - **System prompt 限制**：GitLab Duo 可能拒绝执行自定义 system-like 指令；普通 user/assistant 历史会正常作为上下文传递。
 - **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`/v1/models` 会按当前账号动态返回可用列表。
+- **Codex CLI 模型选择**：优先使用 `claude-sonnet-4.6`、`gpt-5.5`、`gpt-5.4-mini`。`gpt-5-codex` 当前不推荐。
+- **未知 Duo 工具**：当前桥接覆盖 `create_file_with_contents` 和 `run_command`。未来 GitLab Duo 新增 raw `tool_info` 时，需要补充映射。
 
 ---
 
@@ -282,3 +336,24 @@ for chunk in client.chat.completions.create(
 ### 8. 工具调用兼容层
 
 GitLab Duo WebSocket 当前只暴露内部工具字段，外部自定义工具 schema 通过 prompt 模拟兼容 OpenAI `tools`。非流式请求会返回标准 `message.tool_calls`；流式请求在工具场景下会先等待完整上游回复，再发送 `delta.tool_calls` 和 `finish_reason=tool_calls`。
+
+### 9. Codex CLI Responses 兼容层
+
+`/v1/responses` 已实现 Codex CLI 所需的最小 SSE 协议，并针对 Codex CLI 做了以下兼容：
+
+- 过滤 Codex CLI 内置的无名工具，只保留有函数名的 tools。
+- 按客户端 tool schema 输出参数名，例如 `exec_command(cmd=...)`。
+- 捕获 GitLab Duo 的 `TOOL_CALL_APPROVAL_REQUIRED`，把 `create_file_with_contents` 和 `run_command` 桥接为本地 `exec_command`。
+- 当模型在第二轮重复写已经创建的 `.py` 文件时，按历史剩余任务改写为 `python3 <file>.py`。
+- 当同一条命令已经成功执行并返回有效输出时，直接返回最终文本，避免重复执行和 token 浪费。
+
+真实 Codex CLI 验收结果：
+
+| 任务 | 结果 |
+|---|---|
+| `hello.py` 创建并运行 | 通过，输出 `CODEX_GPT55_OK` |
+| `add.py` + `test_add.py` + pytest | 通过，3 tests passed |
+| 修复失败测试 | 通过，`//` 修为 `/` 后测试通过 |
+| 多步文件写入与读取 | 通过 |
+
+当前推荐稳定点：`283dd34 fix: stop repeated successful response tools`。

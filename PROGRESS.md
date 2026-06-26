@@ -30,6 +30,12 @@
 - ✅ `/v1/gitlab/health?deep=true` 主动检测 GitLab Cookie 与 Duo workflow
 - ✅ 上游错误对客户端脱敏，详细信息写服务端日志
 - ✅ 工具调用兼容层：OpenAI `tools/tool_choice` 通过 prompt 模拟，响应包装为 `tool_calls`
+- ✅ `/v1/responses` 最小 SSE 兼容层，Codex CLI 可连接并执行本地命令
+- ✅ Codex CLI `exec_command(cmd=...)` 参数兼容，`missing field 'cmd'` 已修复
+- ✅ GitLab Duo 原生 `create_file_with_contents` / `run_command` 已桥接到 Codex CLI `exec_command`
+- ✅ 重复写文件保护：已写入 `.py` 后，下一步会推进到运行文件
+- ✅ 重复成功命令拦截：同一条成功命令不会反复执行
+- ✅ Codex CLI 真实编程任务验收通过：创建文件、运行命令、pytest、修代码、多步任务
 - 🚧 联网搜索内置提示词尚未实现
 
 ---
@@ -165,6 +171,58 @@ GitLab Duo 的 WebSocket 握手流程：
 | claude-sonnet-4.6-vertex | claude_sonnet_4_6_vertex | Vertex |
 | gpt-5.1 | gpt_5 | OpenAI |
 | gpt-5.5 | gpt_5_5 | OpenAI |
+
+---
+
+## Codex CLI 验收状态（稳定点 283dd34）
+
+当前稳定提交：
+
+```text
+283dd34 fix: stop repeated successful response tools
+```
+
+Codex CLI 版本：`0.142.2`
+
+主测模型：`gpt-5.5`
+
+核心验收：
+
+| 项目 | 结果 |
+|------|------|
+| `/v1/responses` SSE | ✅ Codex CLI 可解析 |
+| `exec_command(cmd=...)` | ✅ 字段正确，`missing field 'cmd'` 为 0 |
+| `hello.py` 创建并运行 | ✅ 输出 `CODEX_GPT55_OK` |
+| 多文件 pytest | ✅ `add.py` + `test_add.py`，3 tests passed |
+| 修复失败测试 | ✅ 先看到失败，再修复并通过 |
+| 多步文件任务 | ✅ 不同命令正常执行 |
+| 重复成功命令 | ✅ 从 7 次降到 1 次 |
+| 4xx / 5xx | ✅ 0 |
+| 敏感信息泄露 | ✅ 无 |
+
+多模型轻量矩阵：
+
+| 模型 | 等级 | 结果 | 备注 |
+|------|------|------|------|
+| `claude-sonnet-4.6` | A | ✅ PASS | 最快，POST 次数少，token 消耗低 |
+| `gpt-5.5` | A | ✅ PASS | 基准稳定 |
+| `gpt-5.4-mini` | A | ✅ PASS | 成本较低，轻量任务表现好 |
+| `gpt-5.4` | B | ✅ PASS | 出现过 `printf` 转义问题，模型自动恢复 |
+| `claude-sonnet-4.6-vertex` | B | ✅ PASS | 出现过 WebSocket reconnect，最终成功 |
+| `gemini-3.5-flash` | C | ✅ PASS | 轮次和 token 消耗偏高 |
+| `gpt-5-codex` | D | ❌ FAIL | Codex CLI metadata 不匹配，当前不推荐 |
+
+推荐：
+
+- 普通聊天：`claude-sonnet-4.6`、`gpt-5.5`、`gpt-5.4-mini`
+- Codex CLI：`claude-sonnet-4.6`、`gpt-5.5`、`gpt-5.4-mini`
+- 暂时排除：`gpt-5-codex`
+
+残余风险：
+
+- GitLab `_gitlab_session` 仍会过期，需要手动更新 Cookie。
+- 当前 raw Duo tool_info 覆盖 `create_file_with_contents` 和 `run_command`；未来 GitLab Duo 新增原生工具名时需要补映射。
+- 多模型矩阵只做轻量任务，复杂大型代码库任务仍需按使用场景继续观察。
 
 ---
 
