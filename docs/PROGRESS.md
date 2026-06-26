@@ -287,22 +287,19 @@ curl https://<your-replit-domain>/v1/chat/completions \
 在仓库根目录运行：
 
 ```bash
-python -m unittest test_context.py
-python -m unittest test_models.py
-python -m unittest test_security.py
-python -m py_compile context.py model_catalog.py security.py server.py gitlab_duo_client.py test_context.py test_models.py test_security.py
+python -m unittest discover -s tests
+python -m py_compile context.py model_catalog.py security.py server.py gitlab_duo_client.py responses_api.py tests/*.py
 ```
 
 期望结果：
 
 ```text
-Ran 7 tests
 OK
 ```
 
 `py_compile` 命令应以退出码 `0` 结束，无语法错误输出。
 
-`test_security.py` 期望结果：
+`tests/test_security.py` 期望结果：
 
 ```text
 Ran 9 tests
@@ -613,11 +610,13 @@ curl http://localhost:8000/v1/chat/completions \
 ├── config.example.json        # 配置模板
 ├── config.json                # 本地运行凭据（gitignore）
 ├── requirements.txt           # Python 依赖
-├── test_context.py            # 上下文测试
-├── test_gitlab_duo_client.py  # Duo 原生 tool_info 桥接测试
-├── test_models.py             # 模型列表测试
-├── test_responses_api.py      # Responses API / Codex CLI 测试
-├── test_server.py             # FastAPI 路由测试
-├── test_security.py           # 安全测试
-└── PROGRESS.md                # 本文件
+├── tests/                     # 单元测试
+│   ├── test_context.py
+│   ├── test_gitlab_duo_client.py
+│   ├── test_models.py
+│   ├── test_responses_api.py
+│   ├── test_server.py
+│   └── test_security.py
+└── docs/
+    └── PROGRESS.md            # 本文件
 ```

@@ -32,7 +32,7 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 | system/user/assistant/tool message | 拼接为带角色标签的 prompt |
 | stream=true | 逐 chunk 转发 SSE |
 | stream=false | 等待 `INPUT_REQUIRED` 后一次性返回 |
-| Responses API | `/v1/responses` 最小 SSE 兼容层 |
+| Responses API | `/v1/responses` SSE / JSON 兼容层 |
 | Codex CLI tool call | GitLab Duo 原生工具桥接为本地 `exec_command` |
 | Bearer API Key | 本地校验，不透传给 GitLab |
 
@@ -49,6 +49,8 @@ model_catalog.py       GitLab GraphQL 模型列表归一化
 responses_api.py       OpenAI Responses API / Codex CLI 兼容层
 security.py            鉴权、脱敏、配置保护 helper
 server.py              FastAPI 服务，暴露 OpenAI 兼容接口
+tests/                 单元测试
+docs/PROGRESS.md       开发与验证记录
 ```
 
 ---
@@ -443,4 +445,4 @@ GitLab Duo WebSocket 当前只暴露内部工具字段，外部自定义工具 s
 | 修复失败测试 | 通过，`//` 修为 `/` 后测试通过 |
 | 多步文件写入与读取 | 通过 |
 
-当前推荐稳定点：`4b42fb1 fix: report unsupported duo tool info`。该提交在 Codex CLI 稳定链路上增加了未知 Duo 工具诊断，已验证的 `create_file_with_contents` / `run_command` 桥接路径保持通过。
+当前推荐稳定点：`main` 最新提交。Codex CLI 稳定链路已覆盖未知 Duo 工具诊断、`create_file_with_contents` / `run_command` 桥接、重复命令拦截、`/v1/responses` 流式与非流式响应。
