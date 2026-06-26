@@ -36,6 +36,7 @@
 - ✅ 重复写文件保护：已写入 `.py` 后，下一步会推进到运行文件
 - ✅ 重复成功命令拦截：同一条成功命令不会反复执行
 - ✅ Codex CLI 真实编程任务验收通过：创建文件、运行命令、pytest、修代码、多步任务
+- ✅ 未知 GitLab Duo 原生 `tool_info` 会返回脱敏诊断，只暴露工具名和参数 key
 - 🚧 联网搜索内置提示词尚未实现
 
 ---
@@ -48,29 +49,24 @@
 2. 选择模板：**Blank** 或 **Node.js**（后者方便配 pnpm 工作区）
 3. 项目名随意，如 `gitlab-duo-proxy`
 
-### 2. 安装 Python 3.12 + 依赖
+### 2. 安装 Python 3.12
 
 Replit 用 Nix 管理系统包，在 Shell 里：
 
-```bash
-# 安装 Python 3.12（Replit Nix 环境）
-# 通过 replit.nix 添加 python312 或直接在包管理面板搜索 python3
+通过 replit.nix 添加 `python312`，或直接在包管理面板搜索 `python3`。进入 Shell 后确认版本：
 
-pip install fastapi uvicorn httpx websockets
+```bash
+python --version
 ```
 
 > **坑 1**：Replit 默认 Python 可能是 3.10，需要手动在 Nix 配置里声明 `pkgs.python312`。
 
-### 3. 上传 / 创建核心文件
+### 3. 拉取项目
 
-```
-gitlab_duo_client.py   # WebSocket 客户端 + 模型映射
-model_catalog.py       # GitLab GraphQL 模型归一化 + alias 解析
-server.py              # FastAPI 路由
-context.py             # OpenAI messages 转 prompt
-security.py            # 鉴权、脱敏、配置保护 helper
-config.example.json    # 配置模板
-config.json            # 本地凭据配置（已被 gitignore）
+```bash
+git clone https://github.com/henryz78/duo2api.git
+cd duo2api
+python -m pip install -r requirements.txt
 ```
 
 ### 4. 配置 Workflow
@@ -87,7 +83,7 @@ paths = ["/"]
 然后添加 Workflow（Replit 左侧工具栏 → Workflows）：
 
 - **名称**：GitLab Duo Proxy
-- **命令**：`cd artifacts/api-server && python3 src/gitlab2api_server.py`
+- **命令**：`python3 server.py`
 - **端口**：8000
 
 ### 5. 填写 config.json
@@ -104,7 +100,7 @@ cp config.example.json config.json
 | `_gitlab_session` | 浏览器 Cookie，F12 → Application → Cookies |
 | `remember_user_token` | 同上，可为空 |
 | `api_key` | 自定义 API Key，供客户端鉴权 |
-| `model` | 默认模型，如 `claude-sonnet-4.5` |
+| `model` | 默认模型，如 `claude-sonnet-4.6` |
 
 ---
 
@@ -174,12 +170,12 @@ GitLab Duo 的 WebSocket 握手流程：
 
 ---
 
-## Codex CLI 验收状态（稳定点 283dd34）
+## Codex CLI 验收状态（稳定点 4b42fb1）
 
 当前稳定提交：
 
 ```text
-283dd34 fix: stop repeated successful response tools
+4b42fb1 fix: report unsupported duo tool info
 ```
 
 Codex CLI 版本：`0.142.2`
@@ -197,6 +193,7 @@ Codex CLI 版本：`0.142.2`
 | 修复失败测试 | ✅ 先看到失败，再修复并通过 |
 | 多步文件任务 | ✅ 不同命令正常执行 |
 | 重复成功命令 | ✅ 从 7 次降到 1 次 |
+| 未知 Duo 工具脱敏诊断 | ✅ 只返回 `name` 和 `args_keys` |
 | 4xx / 5xx | ✅ 0 |
 | 敏感信息泄露 | ✅ 无 |
 
@@ -221,7 +218,7 @@ Codex CLI 版本：`0.142.2`
 残余风险：
 
 - GitLab `_gitlab_session` 仍会过期，需要手动更新 Cookie。
-- 当前 raw Duo tool_info 覆盖 `create_file_with_contents` 和 `run_command`；未来 GitLab Duo 新增原生工具名时需要补映射。
+- 当前 raw Duo tool_info 覆盖 `create_file_with_contents` 和 `run_command`；未来 GitLab Duo 新增原生工具名时，服务会返回脱敏诊断 `Unsupported GitLab Duo tool_info received. name=... args_keys=[...]`，再按工具名补映射。
 - 多模型矩阵只做轻量任务，复杂大型代码库任务仍需按使用场景继续观察。
 
 ---
@@ -240,7 +237,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
@@ -251,7 +248,7 @@ curl https://<your-replit-domain>/v1/chat/completions \
   -H "Authorization: Bearer <api_key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
@@ -350,7 +347,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [
       {"role": "user", "content": "记住关键词 blue-mango，请确认。"},
       {"role": "assistant", "content": "已确认，关键词是 blue-mango。"},
@@ -370,7 +367,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5-codex",
+    "model": "gpt-5.5",
     "messages": [
       {"role": "user", "content": "记住关键词 blue-mango，请确认。"},
       {"role": "assistant", "content": "已确认，关键词是 blue-mango。"},
@@ -390,7 +387,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [
       {"role": "user", "content": "窗口 A 的关键词是 alpha-ctx，请确认。"},
       {"role": "assistant", "content": "已确认，窗口 A 的关键词是 alpha-ctx。"},
@@ -406,7 +403,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [
       {"role": "user", "content": "窗口 B 的关键词是 beta-ctx，请确认。"},
       {"role": "assistant", "content": "已确认，窗口 B 的关键词是 beta-ctx。"},
@@ -496,7 +493,7 @@ curl -i http://localhost:8000/v1/config \
   -H "Content-Type: application/json" \
   -d '{
     "namespace_id": "135817766",
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "api_keys": ["sk-a...1234"]
   }'
 ```
@@ -512,7 +509,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "调用 get_time 工具，只输出工具调用 JSON。"}],
     "tools": [{
       "type": "function",
@@ -535,7 +532,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "调用 get_time 工具，只输出工具调用 JSON。"}],
     "tools": [{
       "type": "function",
@@ -604,13 +601,17 @@ curl http://localhost:8000/v1/chat/completions \
 ├── context.py                 # OpenAI messages 转 prompt
 ├── gitlab_duo_client.py       # WebSocket 客户端核心逻辑
 ├── model_catalog.py           # 动态模型列表归一化与 alias 解析
+├── responses_api.py           # Responses API / Codex CLI 兼容层
 ├── security.py                # 鉴权、脱敏、配置保护 helper
 ├── server.py                  # FastAPI 入口
 ├── config.example.json        # 配置模板
 ├── config.json                # 本地运行凭据（gitignore）
 ├── requirements.txt           # Python 依赖
 ├── test_context.py            # 上下文测试
+├── test_gitlab_duo_client.py  # Duo 原生 tool_info 桥接测试
 ├── test_models.py             # 模型列表测试
+├── test_responses_api.py      # Responses API / Codex CLI 测试
+├── test_server.py             # FastAPI 路由测试
 ├── test_security.py           # 安全测试
 └── PROGRESS.md                # 本文件
 ```

@@ -1,6 +1,6 @@
 # GitLab Duo OpenAI Proxy
 
-将 GitLab Duo Chat 包装成 OpenAI 兼容 API，让任何支持 OpenAI 接口的客户端（ChatBox、Open WebUI、Cursor、Continue、Python openai SDK 等）直接接入 GitLab Duo。
+将 GitLab Duo Chat 包装成 OpenAI 兼容 API，让 ChatBox、Open WebUI、Cursor、Continue、Python openai SDK、Codex CLI 等客户端直接接入 GitLab Duo。
 
 ---
 
@@ -32,6 +32,8 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 | system/user/assistant/tool message | 拼接为带角色标签的 prompt |
 | stream=true | 逐 chunk 转发 SSE |
 | stream=false | 等待 `INPUT_REQUIRED` 后一次性返回 |
+| Responses API | `/v1/responses` 最小 SSE 兼容层 |
+| Codex CLI tool call | GitLab Duo 原生工具桥接为本地 `exec_command` |
 | Bearer API Key | 本地校验，不透传给 GitLab |
 
 ---
@@ -41,7 +43,11 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 ```
 config.example.json    配置模板
 config.json            本地运行配置（cookies、api_keys、服务地址，已被 gitignore）
+context.py             OpenAI messages / tools 转 prompt
 gitlab_duo_client.py   WebSocket 客户端核心逻辑
+model_catalog.py       GitLab GraphQL 模型列表归一化
+responses_api.py       OpenAI Responses API / Codex CLI 兼容层
+security.py            鉴权、脱敏、配置保护 helper
 server.py              FastAPI 服务，暴露 OpenAI 兼容接口
 ```
 
@@ -52,7 +58,7 @@ server.py              FastAPI 服务，暴露 OpenAI 兼容接口
 ### 1. 安装依赖
 
 ```bash
-pip install httpx websockets fastapi "uvicorn[standard]"
+python -m pip install -r requirements.txt
 ```
 
 ### 2. 获取 GitLab Cookie
@@ -60,17 +66,18 @@ pip install httpx websockets fastapi "uvicorn[standard]"
 用浏览器登录 [gitlab.com](https://gitlab.com)，打开开发者工具 → Application → Cookies，复制：
 
 - `_gitlab_session`
-- `remember_user_token`
+- `remember_user_token`（可为空，当前验证中仅 `_gitlab_session` 也能通过）
 
 ### 3. 获取 namespace_id
 
-可以通过 API 查询：
+建议使用 GitLab Ultimate Trial 群组 namespace。可以通过 API 查询：
 
 ```bash
-curl -s "https://gitlab.com/api/v4/namespaces?search=你的用户名" \
+curl -s "https://gitlab.com/api/v4/namespaces?search=你的群组名" \
   -H "Cookie: _gitlab_session=..." | python3 -m json.tool
 ```
-响应中的有两个id字段，第二个就是
+
+选择 `"kind": "group"` 的记录，取它的 `id` 作为 `namespace_id`。
 
 ### 4. 创建并编辑 config.json
 
@@ -83,10 +90,10 @@ cp config.example.json config.json
   "gitlab": {
     "host": "https://gitlab.com",
     "namespace_id": "你的 namespace_id",
-    "model": "claude-opus-4.8",
+    "model": "claude-sonnet-4.6",
     "cookies": {
       "_gitlab_session": "粘贴 cookie 值",
-      "remember_user_token": "粘贴 cookie 值"
+      "remember_user_token": ""
     },
     "user_agent": "Mozilla/5.0 ..."
   },
@@ -110,7 +117,13 @@ python3 server.py
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-启动后访问 `http://localhost:8000/v1/models` 验证服务正常。
+启动后用下面两条命令验证服务和 GitLab 鉴权：
+
+```bash
+curl http://localhost:8000/healthz
+curl "http://localhost:8000/v1/gitlab/health?deep=true" \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
 
 ---
 
@@ -139,10 +152,12 @@ curl "http://localhost:8000/v1/gitlab/health?deep=true" \
 `/v1/responses` 提供 OpenAI Responses API 的最小 SSE 兼容层，主要用于 Codex CLI 这类 agent 客户端。当前已支持：
 
 - `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.completed`
+- `response.function_call_arguments.delta` / `response.function_call_arguments.done`
 - Responses 风格 `function_call` SSE
 - Codex CLI 风格 `exec_command(cmd=...)`
 - GitLab Duo 原生 `create_file_with_contents` / `run_command` 到 `exec_command` 的桥接
 - 重复成功命令拦截，避免同一条本地命令反复执行
+- 未识别 GitLab Duo 原生工具的脱敏诊断：只返回 `name` 和 `args_keys`
 
 Codex CLI 推荐模型：
 
@@ -165,7 +180,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-opus-4.8",
+    "model": "claude-sonnet-4.6",
     "messages": [
       {"role": "system", "content": "你是一个代码专家"},
       {"role": "user", "content": "用 Python 写一个快速排序"}
@@ -180,7 +195,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.5",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "调用 get_time 工具"}],
     "tools": [{
       "type": "function",
@@ -203,7 +218,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer sk-your-custom-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-opus-4.8",
+    "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
@@ -221,6 +236,15 @@ curl http://localhost:8000/v1/chat/completions \
 | API Key | config.json 里设置的 key |
 | 模型 | 从 `/v1/models` 返回列表中选择 |
 
+兼容范围：
+
+| 客户端类型 | 当前状态 |
+|---|---|
+| 普通 OpenAI Chat Completions 客户端 | 支持非流式、流式、模型列表 |
+| Chat Completions tools 客户端 | 支持 `tools` / `tool_choice` prompt 模拟 |
+| Codex CLI | 支持 `/v1/responses` SSE、`exec_command(cmd=...)` 和真实编程任务 |
+| 其他 Responses API 客户端 | 支持文本 SSE 与 function_call SSE；工具 schema 差异较大时按客户端补 normalization |
+
 ### Python openai SDK
 
 ```python
@@ -233,14 +257,14 @@ client = OpenAI(
 
 # 非流式
 resp = client.chat.completions.create(
-    model="claude-opus-4.8",
+    model="claude-sonnet-4.6",
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
 
 # 流式
 for chunk in client.chat.completions.create(
-    model="claude-opus-4.8",
+    model="claude-sonnet-4.6",
     messages=[{"role": "user", "content": "你好"}],
     stream=True,
 ):
@@ -258,6 +282,13 @@ Codex CLI 需要使用 `/v1/responses`。配置自定义 provider 时，将 base
 ```text
 http://localhost:8000/v1
 ```
+
+配置要点：
+
+- provider 使用 OpenAI-compatible Responses API。
+- API Key 使用 `config.json` 里的 `server.api_keys`。
+- 模型优先选 `claude-sonnet-4.6`、`gpt-5.5`、`gpt-5.4-mini`。
+- Codex CLI 的 `exec_command` schema 使用 `cmd` 字段，本项目会按客户端 schema 自动输出正确字段名。
 
 推荐模型：
 
@@ -278,7 +309,7 @@ gpt-5.4-mini
 当前稳定验证点：
 
 ```text
-283dd34 fix: stop repeated successful response tools
+4b42fb1 fix: report unsupported duo tool info
 ```
 
 ---
@@ -286,12 +317,13 @@ gpt-5.4-mini
 ## 注意事项
 
 - **Cookie 有效期**：`remember_user_token` 通常有效期约 2 周，过期后需重新获取。
+- **Session Cookie**：当前验证中 `_gitlab_session` 单独可用，Cookie 失效时用 `/v1/gitlab/health?deep=true` 检查。
 - **对话历史**：服务每次使用客户端发来的完整 `messages` 作为上下文，不在服务端共享聊天历史。
 - **并发隔离**：每个请求创建独立 GitLab Duo workflow，不同客户端窗口不会通过服务端 session 串台。
 - **System prompt 限制**：GitLab Duo 可能拒绝执行自定义 system-like 指令；普通 user/assistant 历史会正常作为上下文传递。
 - **模型选择**：GitLab Duo 支持的模型取决于账户订阅等级，`/v1/models` 会按当前账号动态返回可用列表。
 - **Codex CLI 模型选择**：优先使用 `claude-sonnet-4.6`、`gpt-5.5`、`gpt-5.4-mini`。`gpt-5-codex` 当前不推荐。
-- **未知 Duo 工具**：当前桥接覆盖 `create_file_with_contents` 和 `run_command`。未来 GitLab Duo 新增 raw `tool_info` 时，需要补充映射。
+- **未知 Duo 工具**：当前桥接覆盖 `create_file_with_contents` 和 `run_command`。未来 GitLab Duo 新增 raw `tool_info` 时，服务会返回脱敏诊断 `Unsupported GitLab Duo tool_info received. name=... args_keys=[...]`，再按工具名补映射。
 
 ---
 
@@ -346,6 +378,7 @@ GitLab Duo WebSocket 当前只暴露内部工具字段，外部自定义工具 s
 - 捕获 GitLab Duo 的 `TOOL_CALL_APPROVAL_REQUIRED`，把 `create_file_with_contents` 和 `run_command` 桥接为本地 `exec_command`。
 - 当模型在第二轮重复写已经创建的 `.py` 文件时，按历史剩余任务改写为 `python3 <file>.py`。
 - 当同一条命令已经成功执行并返回有效输出时，直接返回最终文本，避免重复执行和 token 浪费。
+- 当 GitLab Duo 返回新的未知 `tool_info` 时，返回脱敏诊断，只暴露工具名和参数 key。
 
 真实 Codex CLI 验收结果：
 
@@ -356,4 +389,4 @@ GitLab Duo WebSocket 当前只暴露内部工具字段，外部自定义工具 s
 | 修复失败测试 | 通过，`//` 修为 `/` 后测试通过 |
 | 多步文件写入与读取 | 通过 |
 
-当前推荐稳定点：`283dd34 fix: stop repeated successful response tools`。
+当前推荐稳定点：`4b42fb1 fix: report unsupported duo tool info`。该提交在 Codex CLI 稳定链路上增加了未知 Duo 工具诊断，已验证的 `create_file_with_contents` / `run_command` 桥接路径保持通过。
