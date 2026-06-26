@@ -428,13 +428,7 @@ def response_created_sse(resp_id: str, model: str, created_at: int) -> str:
     })
 
 
-def response_function_call_sse(
-    resp_id: str,
-    model: str,
-    created_at: int,
-    tool_call: Mapping[str, Any],
-    usage: Mapping[str, Any],
-) -> str:
+def function_call_output_items(tool_call: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     function = tool_call.get("function") if isinstance(tool_call.get("function"), Mapping) else {}
     name = str(function.get("name", "")).strip()
     arguments = str(function.get("arguments", "{}"))
@@ -449,6 +443,20 @@ def response_function_call_sse(
         "status": "in_progress",
     }
     done_item = {**added_item, "arguments": arguments, "status": "completed"}
+    return added_item, done_item
+
+
+def response_function_call_sse(
+    resp_id: str,
+    model: str,
+    created_at: int,
+    tool_call: Mapping[str, Any],
+    usage: Mapping[str, Any],
+) -> str:
+    added_item, done_item = function_call_output_items(tool_call)
+    item_id = str(done_item["id"])
+    call_id = str(done_item["call_id"])
+    arguments = str(done_item["arguments"])
     chunks = [
         sse_event("response.output_item.added", {
             "type": "response.output_item.added",

@@ -169,6 +169,141 @@ class ServerToolTests(unittest.TestCase):
         self.assertEqual(type(response).__name__, "StreamingResponse")
         self.assertEqual(captured["tools"], [named_tool])
 
+    def test_responses_stream_false_returns_json_response(self):
+        captured: dict[str, object] = {}
+
+        async def fake_complete(*args, **kwargs):
+            captured["called"] = True
+            captured["tools"] = kwargs["tools"]
+            return server.JSONResponse(content={"object": "response", "status": "completed"})
+
+        named_tool = {
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            },
+        }
+        originals = {
+            "_check_auth": server._check_auth,
+            "_load_config": server._load_config,
+            "get_available_models": server.get_available_models,
+            "is_known_model": server.is_known_model,
+            "resolve_gitlab_model_id": server.resolve_gitlab_model_id,
+            "_do_responses_complete": server._do_responses_complete,
+        }
+        server._check_auth = lambda request: None
+        server._load_config = lambda: {"gitlab": {"model": "gpt-5.5"}}
+
+        async def fake_get_available_models():
+            return []
+
+        server.get_available_models = fake_get_available_models
+        server.is_known_model = lambda model, models: True
+        server.resolve_gitlab_model_id = lambda model, models: "gpt_5_5"
+        server._do_responses_complete = fake_complete
+        try:
+            response = asyncio.run(server.responses(
+                object(),
+                server.ResponsesRequest(
+                    model="gpt-5.5",
+                    input="Create hello.py",
+                    stream=False,
+                    tools=[named_tool],
+                    tool_choice="auto",
+                ),
+            ))
+        finally:
+            for name, original in originals.items():
+                setattr(server, name, original)
+
+        self.assertEqual(type(response).__name__, "JSONResponse")
+        self.assertTrue(captured["called"])
+        self.assertEqual(captured["tools"], [named_tool])
+
+    def test_do_responses_complete_returns_text_json(self):
+        class FakeDuoChat:
+            async def send(self, prompt, model=None):
+                return "hello from responses"
+
+            async def close(self):
+                return None
+
+        original = server.DuoChat
+        server.DuoChat = FakeDuoChat
+        try:
+            response = asyncio.run(server._do_responses_complete(
+                "prompt",
+                "resp_test",
+                4,
+                "gpt-5.5",
+                "gpt_5_5",
+            ))
+        finally:
+            server.DuoChat = original
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["object"], "response")
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["output"][0]["type"], "message")
+        self.assertEqual(payload["output"][0]["content"][0]["text"], "hello from responses")
+        self.assertEqual(payload["usage"]["input_tokens"], 4)
+
+    def test_do_responses_complete_returns_function_call_json(self):
+        class FakeDuoChat:
+            async def close(self):
+                return None
+
+        async def fake_send_with_optional_tool_retry(*args, **kwargs):
+            return "", [{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": '{"command":"python3 hello.py"}',
+                },
+            }], 2
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            },
+        }]
+        originals = {
+            "DuoChat": server.DuoChat,
+            "_send_with_optional_tool_retry": server._send_with_optional_tool_retry,
+        }
+        server.DuoChat = FakeDuoChat
+        server._send_with_optional_tool_retry = fake_send_with_optional_tool_retry
+        try:
+            response = asyncio.run(server._do_responses_complete(
+                "prompt",
+                "resp_test",
+                4,
+                "gpt-5.5",
+                "gpt_5_5",
+                tools_enabled=True,
+                messages=[],
+                tools=tools,
+                tool_choice="auto",
+            ))
+        finally:
+            for name, original in originals.items():
+                setattr(server, name, original)
+
+        payload = json.loads(response.body)
+        item = payload["output"][0]
+        self.assertEqual(item["type"], "function_call")
+        self.assertEqual(item["call_id"], "call_abc")
+        self.assertEqual(item["name"], "exec_command")
+        self.assertEqual(json.loads(item["arguments"]), {"cmd": "python3 hello.py"})
+
     def test_auto_tool_choice_retries_once_when_tool_intent_is_explicit(self):
         class FakeDuoChat:
             prompts: list[str] = []

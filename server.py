@@ -43,6 +43,7 @@ from security import (
 )
 from responses_api import (
     build_responses_prompt,
+    function_call_output_items,
     normalize_tool_call_for_response,
     normalize_tool_call_for_response_tools,
     response_completed_sse,
@@ -714,6 +715,19 @@ async def responses(request: Request, body: ResponsesRequest):
     resp_id = f"resp_{uuid.uuid4().hex}"
     tools_allowed = _tools_allowed(named_tools, body.tool_choice)
 
+    if not body.stream:
+        return await _do_responses_complete(
+            prompt,
+            resp_id,
+            prompt_tokens,
+            model,
+            upstream_model,
+            tools_enabled=tools_allowed,
+            messages=responses_body_to_messages(body_data),
+            tools=named_tools,
+            tool_choice=body.tool_choice,
+        )
+
     return StreamingResponse(
         _do_responses_stream(
             prompt,
@@ -849,6 +863,75 @@ def _responses_usage(input_tokens: int, output_tokens: int) -> dict[str, int]:
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+
+
+def _responses_payload(
+    resp_id: str,
+    model: str,
+    created_at: int,
+    output: list[dict[str, Any]],
+    usage: dict[str, int],
+) -> dict[str, Any]:
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "usage": usage,
+    }
+
+
+async def _do_responses_complete(
+    prompt: str,
+    resp_id: str,
+    prompt_tokens: int,
+    model: str,
+    upstream_model: str,
+    *,
+    tools_enabled: bool = False,
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+):
+    created_at = int(time.time())
+    session = DuoChat()
+    try:
+        if tools_enabled:
+            full, tool_calls, completion_tokens = await _send_with_optional_tool_retry(
+                session,
+                prompt,
+                upstream_model,
+                messages=messages or [],
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+        else:
+            full = await session.send(prompt, model=upstream_model)
+            completion_tokens = _estimate_tokens(full)
+            tool_calls = []
+    except Exception as e:
+        logger.warning("GitLab Duo upstream responses error: %s", e)
+        return _openai_error(502, "upstream_error", public_upstream_error_message(e))
+    finally:
+        await session.close()
+
+    usage = _responses_usage(prompt_tokens, completion_tokens)
+    if tool_calls:
+        tool_call = normalize_tool_call_for_response(tool_calls[0], tools, messages)
+        repeated_text = response_text_for_repeated_completed_tool_call(tool_call, messages)
+        if repeated_text:
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            _, done_item = text_output_items(message_id, repeated_text)
+            return JSONResponse(content=_responses_payload(resp_id, model, created_at, [done_item], usage))
+
+        _, done_item = function_call_output_items(tool_call)
+        return JSONResponse(content=_responses_payload(resp_id, model, created_at, [done_item], usage))
+
+    message_id = f"msg_{uuid.uuid4().hex[:16]}"
+    _, done_item = text_output_items(message_id, full)
+    return JSONResponse(content=_responses_payload(resp_id, model, created_at, [done_item], usage))
 
 
 async def _do_responses_stream(
