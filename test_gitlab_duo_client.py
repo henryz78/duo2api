@@ -8,7 +8,7 @@ sys.modules.setdefault("httpx", types.SimpleNamespace(AsyncClient=object))
 sys.modules.setdefault("websockets", types.SimpleNamespace(connect=None))
 
 from context import extract_tool_calls
-from gitlab_duo_client import _recv_until_done
+from gitlab_duo_client import _recv_until_done, normalize_config
 
 
 def _checkpoint_with_tool(tool_info):
@@ -46,6 +46,22 @@ class FakeWebSocket:
 
 
 class GitLabDuoToolApprovalTests(unittest.TestCase):
+    def test_normalize_config_accepts_legacy_session_and_root_api_keys(self):
+        cfg = normalize_config({
+            "gitlab": {
+                "session": "legacy-session",
+                "namespace_id": "135911158",
+                "model": "gpt-5.5",
+            },
+            "api_keys": ["sk-legacy"],
+        })
+
+        self.assertEqual(cfg["gitlab"]["cookies"]["_gitlab_session"], "legacy-session")
+        self.assertEqual(cfg["gitlab"]["cookies"]["remember_user_token"], "")
+        self.assertEqual(cfg["server"]["api_keys"], ["sk-legacy"])
+        self.assertEqual(cfg["server"]["host"], "0.0.0.0")
+        self.assertEqual(cfg["server"]["port"], 8000)
+
     def test_recv_until_done_bridges_create_file_tool_info_to_exec_command(self):
         checkpoint = _checkpoint_with_tool({
             "name": "create_file_with_contents",

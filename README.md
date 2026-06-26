@@ -109,6 +109,8 @@ cp config.example.json config.json
 
 `config.json` 保存真实 Cookie 和 API Key，本仓库只提交 `config.example.json` 模板。`api_keys` 留空数组 `[]` 表示聊天接口不鉴权（仅建议本地使用），管理配置接口需要至少一个 API Key。
 
+旧版配置也会被启动时兼容读取：`gitlab.session` 会映射为 `gitlab.cookies._gitlab_session`，根级 `api_keys` 会映射为 `server.api_keys`。建议打开根路径 `/` 的配置页保存一次，配置文件会自然更新为当前结构。
+
 ### 5. 启动服务
 
 本机 Python 启动：

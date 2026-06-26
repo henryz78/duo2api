@@ -26,10 +26,30 @@ def looks_like_redacted_secret(value: str | None) -> bool:
     return text == "********" or (len(text) == 11 and text[4:7] == "...")
 
 
+def _config_cookies(cfg: dict[str, Any]) -> dict[str, Any]:
+    gitlab = cfg.get("gitlab", {})
+    if not isinstance(gitlab, dict):
+        return {}
+    cookies = gitlab.get("cookies")
+    if isinstance(cookies, dict):
+        return cookies
+    session = str(gitlab.get("session") or "").strip()
+    remember = str(gitlab.get("remember_user_token") or "").strip()
+    return {"_gitlab_session": session, "remember_user_token": remember}
+
+
+def _config_api_keys(cfg: dict[str, Any]) -> list[Any]:
+    server = cfg.get("server", {})
+    if isinstance(server, dict) and isinstance(server.get("api_keys"), list):
+        return server["api_keys"]
+    legacy = cfg.get("api_keys")
+    return legacy if isinstance(legacy, list) else []
+
+
 def public_config_status(cfg: dict[str, Any], available_models: int) -> dict[str, Any]:
     gitlab = cfg.get("gitlab", {})
-    cookies = gitlab.get("cookies", {})
-    api_keys = cfg.get("server", {}).get("api_keys", [])
+    cookies = _config_cookies(cfg)
+    api_keys = _config_api_keys(cfg)
     return {
         "namespace_id": gitlab.get("namespace_id", ""),
         "model": gitlab.get("model", ""),
@@ -101,7 +121,7 @@ def auth_keys_from_config(config_path: Path, *, now: float | None = None) -> set
 
     with open(resolved) as f:
         cfg: dict[str, Any] = json.load(f)
-    keys = tuple(str(k) for k in cfg.get("server", {}).get("api_keys", []) if k)
+    keys = tuple(str(k) for k in _config_api_keys(cfg) if k)
     _auth_cache = (current, resolved, keys)
     return set(keys)
 

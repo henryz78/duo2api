@@ -14,9 +14,46 @@ from model_catalog import normalize_graphql_models, resolve_model_id
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
+def normalize_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    gitlab = cfg.setdefault("gitlab", {})
+    if not isinstance(gitlab, dict):
+        gitlab = {}
+        cfg["gitlab"] = gitlab
+
+    cookies = gitlab.get("cookies")
+    if not isinstance(cookies, dict):
+        cookies = {}
+        gitlab["cookies"] = cookies
+
+    legacy_session = str(gitlab.get("session") or "").strip()
+    if legacy_session and not str(cookies.get("_gitlab_session") or "").strip():
+        cookies["_gitlab_session"] = legacy_session
+
+    legacy_remember = str(gitlab.get("remember_user_token") or "").strip()
+    cookies.setdefault("remember_user_token", legacy_remember)
+
+    gitlab.setdefault("host", GITLAB_HOST)
+    gitlab.setdefault("model", "claude-sonnet-4.6")
+    gitlab.setdefault("user_agent", "Mozilla/5.0")
+
+    server = cfg.get("server")
+    if not isinstance(server, dict):
+        server = {}
+        cfg["server"] = server
+
+    legacy_api_keys = cfg.get("api_keys")
+    if isinstance(legacy_api_keys, list) and not server.get("api_keys"):
+        server["api_keys"] = legacy_api_keys
+    server.setdefault("host", "0.0.0.0")
+    server.setdefault("port", 8000)
+    server.setdefault("api_keys", [])
+
+    return cfg
+
+
 def _load_config() -> dict:
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        return normalize_config(json.load(f))
 
 
 def _gitlab_cfg() -> dict:

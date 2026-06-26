@@ -51,6 +51,24 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn("remember-secret", serialized)
         self.assertNotIn("sk-live-secret-1234", serialized)
 
+    def test_public_config_status_accepts_legacy_config_shape(self):
+        cfg = {
+            "gitlab": {
+                "namespace_id": "135817766",
+                "model": "gpt-5.5",
+                "session": "legacy-cookie-secret",
+            },
+            "api_keys": ["sk-legacy-secret"],
+        }
+
+        status = public_config_status(cfg, available_models=31)
+        serialized = json.dumps(status)
+
+        self.assertTrue(status["has_session_cookie"])
+        self.assertEqual(status["api_keys_count"], 1)
+        self.assertNotIn("legacy-cookie-secret", serialized)
+        self.assertNotIn("sk-legacy-secret", serialized)
+
     def test_redacted_api_keys_are_rejected_without_overwriting_config(self):
         cfg = self._config_data()
 
@@ -104,6 +122,15 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(cached, {"sk-live-secret-1234"})
         self.assertEqual(refreshed, {"sk-new-secret"})
 
+    def test_auth_keys_from_config_accepts_legacy_root_api_keys(self):
+        with self._temp_config({
+            "gitlab": {"session": "legacy-cookie-secret", "namespace_id": "135817766"},
+            "api_keys": ["sk-legacy-secret"],
+        }) as config_path:
+            keys = auth_keys_from_config(config_path, now=200.0)
+
+        self.assertEqual(keys, {"sk-legacy-secret"})
+
     def _config_data(self):
         return {
             "gitlab": {
@@ -122,8 +149,9 @@ class SecurityTests(unittest.TestCase):
             },
         }
 
-    def _temp_config(self):
-        data = self._config_data()
+    def _temp_config(self, data=None):
+        if data is None:
+            data = self._config_data()
         tmp = tempfile.TemporaryDirectory()
         path = Path(tmp.name) / "config.json"
         with open(path, "w") as f:
