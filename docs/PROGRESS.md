@@ -30,8 +30,14 @@
 - ✅ `/v1/gitlab/health?deep=true` 主动检测 GitLab Cookie 与 Duo workflow
 - ✅ 上游错误对客户端脱敏，详细信息写服务端日志
 - ✅ `/v1/status` 本地诊断端点，支持 `deep=true` GitLab 鉴权检查
+- ✅ `/v1/models/{model}` 单模型查询，支持 friendly ID、GitLab ID 与 alias
 - ✅ 工具调用兼容层：OpenAI `tools/tool_choice` 通过 prompt 模拟，响应包装为 `tool_calls`
-- ✅ `/v1/responses` 最小 SSE 兼容层，Codex CLI 可连接并执行本地命令
+- ✅ `/v1/responses` 最小 SSE / JSON 兼容层，Codex CLI 可连接并执行本地命令
+- ✅ Responses SSE 已补齐 `response.in_progress`、`content_part.added/done`、`output_text.done`
+- ✅ Chat Completions 已兼容 `stream_options.include_usage`、`max_completion_tokens`、`response_format`、`parallel_tool_calls`
+- ✅ Chat Completions 已兼容旧版 `functions/function_call` 工具参数和旧版 `message.function_call` 响应形状
+- ✅ Chat/Responses 会把 `response_format` / `text.format` / token limit 转成 prompt 约束
+- ✅ Chat Completions 非流式文本响应会应用 `stop` 截断
 - ✅ Codex CLI `exec_command(cmd=...)` 参数兼容，`missing field 'cmd'` 已修复
 - ✅ GitLab Duo 原生 `create_file_with_contents` / `run_command` 已桥接到 Codex CLI `exec_command`
 - ✅ 重复写文件保护：已写入 `.py` 后，下一步会推进到运行文件
@@ -39,6 +45,8 @@
 - ✅ Codex CLI 真实编程任务验收通过：创建文件、运行命令、pytest、修代码、多步任务
 - ✅ 未知 GitLab Duo 原生 `tool_info` 会返回脱敏诊断，只暴露工具名和参数 key
 - ✅ Dockerfile + docker-compose.yml 已提供，支持挂载本地 `config.json` 一键启动
+- ✅ `scripts/openai_compat_smoke.py` 可快速验收模型、Chat Completions 与 Responses API 兼容性
+- ✅ GitHub Actions CI 已加入，自动跑依赖安装、py_compile 与单元测试
 - 🚧 联网搜索内置提示词尚未实现
 
 ---
@@ -172,12 +180,12 @@ GitLab Duo 的 WebSocket 握手流程：
 
 ---
 
-## Codex CLI 验收状态（稳定点 4b42fb1）
+## Codex CLI 验收状态（稳定点：main 最新提交）
 
 当前稳定提交：
 
 ```text
-4b42fb1 fix: report unsupported duo tool info
+main 最新提交
 ```
 
 Codex CLI 版本：`0.142.2`
@@ -227,9 +235,34 @@ Codex CLI 版本：`0.142.2`
 
 ## API 使用方法
 
+### OpenAI 兼容性 smoke test
+
+启动服务后，可用仓库内置脚本快速跑一遍主要 OpenAI 兼容路径：
+
+```bash
+DUO2API_BASE_URL=http://127.0.0.1:8000/v1 \
+DUO2API_API_KEY=sk-your-custom-key \
+python scripts/openai_compat_smoke.py --model gpt-5.5
+```
+
+脚本覆盖：
+
+- `/v1/models`
+- `/v1/models/{model}`
+- `/v1/chat/completions` 非流式
+- `/v1/chat/completions` 流式 + `stream_options.include_usage`
+- `/v1/responses` 非流式
+- `/v1/responses` 流式 SSE
+
 ### 获取模型列表
 ```bash
 curl https://<your-replit-domain>/v1/models \
+  -H "Authorization: Bearer <api_key>"
+```
+
+### 获取单个模型
+```bash
+curl https://<your-replit-domain>/v1/models/gpt-5.5 \
   -H "Authorization: Bearer <api_key>"
 ```
 
@@ -273,8 +306,13 @@ curl https://<your-replit-domain>/v1/chat/completions \
 - [x] **模型校验**：未知模型 ID 返回 OpenAI 风格 400 错误
 - [x] **动态模型列表**：通过 GitLab GraphQL 获取当前账号可用模型，失败时使用 fallback
 - [x] **状态诊断端点**：`/v1/status` 返回版本、功能、配置、模型缓存与 GitLab deep health
+- [x] **OpenAI 兼容性补齐**：支持 `/v1/models/{model}`、Responses JSON、Responses 完整文本 SSE、Chat `stream_options.include_usage`
+- [x] **旧版工具参数兼容**：Chat Completions 支持 `functions/function_call` 自动转换为 `tools/tool_choice`，并在旧参数请求下返回旧版 `function_call`
+- [x] **格式与长度提示约束**：Chat `response_format` / Responses `text.format` / token limit 会注入 prompt 约束
+- [x] **Stop 序列**：Chat Completions 非流式文本响应支持 `stop` 截断
 - [ ] **Cookie 自动刷新**：检测 session 过期并提示用户更新
 - [x] **Docker 部署**：提供 Dockerfile 和 docker-compose.yml，方便自托管
+- [x] **CI 验证**：GitHub Actions 自动跑 Python 3.11/3.12 编译与单元测试
 
 ---
 
@@ -598,6 +636,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```
 .
+├── .github/workflows/ci.yml   # GitHub Actions CI
 ├── .dockerignore              # Docker build 排除规则
 ├── context.py                 # OpenAI messages 转 prompt
 ├── Dockerfile                 # Docker 镜像构建
@@ -607,6 +646,8 @@ curl http://localhost:8000/v1/chat/completions \
 ├── responses_api.py           # Responses API / Codex CLI 兼容层
 ├── security.py                # 鉴权、脱敏、配置保护 helper
 ├── server.py                  # FastAPI 入口
+├── scripts/
+│   └── openai_compat_smoke.py # OpenAI 兼容性 smoke test
 ├── config.example.json        # 配置模板
 ├── config.json                # 本地运行凭据（gitignore）
 ├── requirements.txt           # Python 依赖

@@ -43,12 +43,14 @@ GitLab Duo Chat 的底层通信协议是 WebSocket，流程如下：
 ```
 config.example.json    配置模板
 config.json            本地运行配置（cookies、api_keys、服务地址，已被 gitignore）
+.github/workflows/ci.yml  GitHub Actions：安装依赖、py_compile、单元测试
 context.py             OpenAI messages / tools 转 prompt
 gitlab_duo_client.py   WebSocket 客户端核心逻辑
 model_catalog.py       GitLab GraphQL 模型列表归一化
 responses_api.py       OpenAI Responses API / Codex CLI 兼容层
 security.py            鉴权、脱敏、配置保护 helper
 server.py              FastAPI 服务，暴露 OpenAI 兼容接口
+scripts/               运维与兼容性 smoke test 脚本
 tests/                 单元测试
 docs/PROGRESS.md       开发与验证记录
 ```
@@ -176,6 +178,15 @@ curl http://localhost:8000/v1/models \
 
 `/v1/models` 会优先通过 GitLab GraphQL `aiChatAvailableModels` 读取当前账号实际可用模型，结果缓存 5 分钟；GraphQL 请求失败时使用内置 fallback 列表。
 
+### GET /v1/models/{model}
+
+```bash
+curl http://localhost:8000/v1/models/gpt-5.5 \
+  -H "Authorization: Bearer sk-your-custom-key"
+```
+
+返回单个 OpenAI 风格 `model` 对象。`model` 可以使用 `/v1/models` 里的 `id`，也可以使用该模型的 `gitlab_id` 或 `aliases`。
+
 ### GET /v1/status
 
 ```bash
@@ -184,6 +195,19 @@ curl http://localhost:8000/v1/status \
 ```
 
 `/v1/status` 返回本地诊断信息：当前 commit/branch、功能开关、配置是否已填、模型缓存状态、fallback 模型数量。轻量模式读取本地配置并秒回。
+
+其中 `features` 会标出当前部署是否包含关键兼容能力，例如：
+
+- `single_model_endpoint`
+- `chat_stream_usage`
+- `chat_legacy_functions`
+- `chat_legacy_function_call_response`
+- `prompted_response_format`
+- `prompted_token_limits`
+- `chat_stop_non_stream`
+- `responses_non_stream`
+- `responses_text_sse_done_events`
+- `duo_tool_bridge`
 
 深度检查：
 
@@ -207,9 +231,16 @@ curl "http://localhost:8000/v1/gitlab/health?deep=true" \
 
 `/v1/responses` 提供 OpenAI Responses API 的最小 SSE 兼容层，主要用于 Codex CLI 这类 agent 客户端。当前已支持：
 
-- `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.completed`
+- `stream=false` JSON 响应
+- `stream=true` SSE 响应
+- `response.created` / `response.in_progress`
+- `response.output_item.added` / `response.content_part.added`
+- `response.output_text.delta` / `response.output_text.done`
+- `response.content_part.done` / `response.output_item.done` / `response.completed`
 - `response.function_call_arguments.delta` / `response.function_call_arguments.done`
 - Responses 风格 `function_call` SSE
+- `metadata` / `reasoning` / `store` / `truncation` / `parallel_tool_calls` 等常见客户端字段的兼容接收
+- `text.format` 与 `max_output_tokens` 会转换为 prompt 约束
 - Codex CLI 风格 `exec_command(cmd=...)`
 - GitLab Duo 原生 `create_file_with_contents` / `run_command` 到 `exec_command` 的桥接
 - 重复成功命令拦截，避免同一条本地命令反复执行
@@ -277,8 +308,25 @@ curl http://localhost:8000/v1/chat/completions \
     "model": "claude-sonnet-4.6",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
-  }'
+}'
 ```
+
+常见 OpenAI 客户端字段兼容：
+
+- `max_tokens`
+- `max_completion_tokens`
+- `stop`（非流式文本响应会实际截断）
+- `stream_options.include_usage`
+- `response_format`
+- `parallel_tool_calls`
+- `tools`
+- `tool_choice`
+- 旧版 `functions`
+- 旧版 `function_call`（请求使用旧参数时，响应也会返回旧 `message.function_call` / `delta.function_call`）
+
+`stream_options.include_usage=true` 时，流式响应会在 `[DONE]` 前额外发送一个 `choices: []` 的 usage chunk。
+
+`response_format` 和 `max_tokens` / `max_completion_tokens` 会转换为 prompt 约束发送给 GitLab Duo。GitLab Duo 不提供原生硬约束接口，因此这里是兼容层提示约束。
 
 ---
 
@@ -296,10 +344,30 @@ curl http://localhost:8000/v1/chat/completions \
 
 | 客户端类型 | 当前状态 |
 |---|---|
-| 普通 OpenAI Chat Completions 客户端 | 支持非流式、流式、模型列表 |
+| 普通 OpenAI Chat Completions 客户端 | 支持非流式、流式、模型列表、单模型查询、常见兼容字段 |
 | Chat Completions tools 客户端 | 支持 `tools` / `tool_choice` prompt 模拟 |
-| Codex CLI | 支持 `/v1/responses` SSE、`exec_command(cmd=...)` 和真实编程任务 |
-| 其他 Responses API 客户端 | 支持文本 SSE 与 function_call SSE；工具 schema 差异较大时按客户端补 normalization |
+| Codex CLI | 支持 `/v1/responses` SSE / JSON、`exec_command(cmd=...)` 和真实编程任务 |
+| 其他 Responses API 客户端 | 支持文本 JSON、文本 SSE 与 function_call SSE；工具 schema 差异较大时按客户端补 normalization |
+
+### OpenAI 兼容性 smoke test
+
+仓库提供一个标准库脚本，用来快速检查正在运行的服务是否满足常见 OpenAI 客户端调用路径。脚本不会打印 API Key 或 GitLab Cookie。
+HTTP 错误响应预览会对常见 API key / token / cookie 形态做脱敏。
+
+```bash
+DUO2API_BASE_URL=http://127.0.0.1:8000/v1 \
+DUO2API_API_KEY=sk-your-custom-key \
+python scripts/openai_compat_smoke.py --model gpt-5.5
+```
+
+覆盖项：
+
+- `/v1/models`
+- `/v1/models/{model}`
+- `/v1/chat/completions` 非流式
+- `/v1/chat/completions` 流式 + `stream_options.include_usage`
+- `/v1/responses` 非流式
+- `/v1/responses` 流式 SSE
 
 ### Python openai SDK
 
@@ -365,7 +433,7 @@ gpt-5.4-mini
 当前稳定验证点：
 
 ```text
-4b42fb1 fix: report unsupported duo tool info
+main 最新提交
 ```
 
 ---

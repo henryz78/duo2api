@@ -6,7 +6,9 @@ from responses_api import (
     build_responses_prompt,
     normalize_tool_call_for_response,
     normalize_tool_call_for_response_tools,
+    response_in_progress_sse,
     response_function_call_sse,
+    response_text_output_sse,
     response_text_for_repeated_completed_tool_call,
     responses_input_to_messages,
 )
@@ -146,6 +148,68 @@ class ResponsesApiTests(unittest.TestCase):
         self.assertIn('"call_id": "call_abc"', text)
         self.assertIn('"name": "exec_command"', text)
         self.assertIn('"arguments": "{\\"cmd\\":\\"ls\\"}"', text)
+
+    def test_response_in_progress_sse_uses_responses_event(self):
+        text = response_in_progress_sse("resp_123", "gpt-5.5", 123456)
+
+        self.assertIn("event: response.in_progress", text)
+        self.assertIn('"type": "response.in_progress"', text)
+        self.assertIn('"status": "in_progress"', text)
+
+    def test_response_text_output_sse_uses_complete_text_events(self):
+        text = response_text_output_sse(
+            "resp_123",
+            "gpt-5.5",
+            123456,
+            "msg_abc",
+            "hello",
+            {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+        )
+
+        expected_order = [
+            "event: response.output_item.added",
+            "event: response.content_part.added",
+            "event: response.output_text.delta",
+            "event: response.output_text.done",
+            "event: response.content_part.done",
+            "event: response.output_item.done",
+            "event: response.completed",
+        ]
+        positions = [text.index(marker) for marker in expected_order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('"delta": "hello"', text)
+        self.assertIn('"text": "hello"', text)
+
+    def test_build_responses_prompt_adds_json_and_token_constraints(self):
+        prompt = build_responses_prompt({
+            "input": "return data",
+            "max_output_tokens": 80,
+            "text": {"format": {"type": "json_object"}},
+        })
+
+        self.assertIn("[Response Constraints]", prompt)
+        self.assertIn("valid JSON object", prompt)
+        self.assertIn("approximately 80 output tokens", prompt)
+
+    def test_build_responses_prompt_accepts_text_format_schema_field(self):
+        prompt = build_responses_prompt({
+            "input": "return data",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                    },
+                },
+            },
+        })
+
+        self.assertIn("JSON schema", prompt)
+        self.assertIn('"answer":{"type":"string"}', prompt)
+        self.assertIn('"required":["answer"]', prompt)
 
     def test_normalize_tool_call_uses_cmd_when_client_schema_requires_it(self):
         tool_call = {

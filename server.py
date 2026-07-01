@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -49,6 +50,8 @@ from responses_api import (
     response_completed_sse,
     response_created_sse,
     response_function_call_sse,
+    response_in_progress_sse,
+    response_text_output_sse,
     response_text_for_repeated_completed_tool_call,
     responses_body_to_messages,
     responses_named_tools,
@@ -75,6 +78,31 @@ def _openai_error(status: int, code: str, message: str, param=None) -> JSONRespo
                            "type": "invalid_request_error" if status < 500 else "server_error",
                            "param": param, "code": code}},
     )
+
+
+def _validation_error_param_and_message(exc: RequestValidationError) -> tuple[str | None, str]:
+    errors = exc.errors()
+    if not errors:
+        return None, "Invalid request."
+
+    first = errors[0]
+    loc = first.get("loc", [])
+    param_parts = [
+        str(part)
+        for part in loc
+        if str(part) not in ("body", "query", "path")
+    ]
+    param = ".".join(param_parts) if param_parts else None
+    message = str(first.get("msg") or "Invalid request.")
+    if param:
+        message = f"{param}: {message}"
+    return param, message
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    param, message = _validation_error_param_and_message(exc)
+    return _openai_error(400, "invalid_request_error", message, param=param)
 
 
 def _check_auth(request: Request, *, require_configured_keys: bool = False) -> JSONResponse | None:
@@ -104,11 +132,14 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str = "claude-sonnet-4.6"
     messages: list[Message]
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     top_p: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
@@ -116,6 +147,39 @@ class ChatRequest(BaseModel):
     user: str | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    functions: list[dict[str, Any]] | None = None
+    function_call: str | dict[str, Any] | None = None
+    stream_options: dict[str, Any] | None = None
+    response_format: dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+
+
+def _legacy_functions_to_tools(functions: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if not functions:
+        return None
+    return [{"type": "function", "function": function} for function in functions]
+
+
+def _legacy_function_call_to_tool_choice(function_call: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
+    if function_call is None or function_call in ("auto", "none"):
+        return function_call
+    if isinstance(function_call, dict):
+        name = str(function_call.get("name", "")).strip()
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return function_call
+
+
+def _chat_tools(body: ChatRequest) -> list[dict[str, Any]] | None:
+    return body.tools if body.tools is not None else _legacy_functions_to_tools(body.functions)
+
+
+def _chat_tool_choice(body: ChatRequest) -> str | dict[str, Any] | None:
+    return body.tool_choice if body.tool_choice is not None else _legacy_function_call_to_tool_choice(body.function_call)
+
+
+def _chat_uses_legacy_functions(body: ChatRequest) -> bool:
+    return body.tools is None and bool(body.functions)
 
 
 class ResponsesRequest(BaseModel):
@@ -129,18 +193,68 @@ class ResponsesRequest(BaseModel):
     temperature: float | None = None
     max_output_tokens: int | None = None
     instructions: str | None = None
+    text: dict[str, Any] | None = None
+    previous_response_id: str | None = None
+    metadata: dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+    reasoning: dict[str, Any] | None = None
+    store: bool | None = None
+    truncation: str | None = None
 
 
 def _tools_allowed(tools: list[dict[str, Any]] | None, tool_choice: str | dict[str, Any] | None) -> bool:
     return bool(tools) and tool_choice != "none"
 
 
+def _json_response_format_instruction(response_format: dict[str, Any] | None) -> str:
+    if not isinstance(response_format, dict):
+        return ""
+    format_type = str(response_format.get("type", "")).strip()
+    if format_type == "json_object":
+        return "Return only a valid JSON object. Do not wrap it in markdown."
+    if format_type == "json_schema":
+        schema = response_format.get("json_schema")
+        if not isinstance(schema, dict):
+            schema = response_format.get("schema")
+        if isinstance(schema, dict):
+            return (
+                "Return only JSON that conforms to this JSON schema. Do not wrap it in markdown:\n"
+                + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
+        return "Return only JSON that conforms to the requested JSON schema. Do not wrap it in markdown."
+    return ""
+
+
+def _chat_response_constraints(body: ChatRequest) -> list[str]:
+    constraints: list[str] = []
+    json_instruction = _json_response_format_instruction(body.response_format)
+    if json_instruction:
+        constraints.append(json_instruction)
+    token_limit = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
+    if isinstance(token_limit, int) and token_limit > 0:
+        constraints.append(f"Keep the answer within approximately {token_limit} output tokens.")
+    return constraints
+
+
+def _append_response_constraints(prompt: str, constraints: list[str]) -> str:
+    if not constraints:
+        return prompt
+    return "\n\n".join([
+        prompt,
+        "[Response Constraints]",
+        "\n".join(f"- {constraint}" for constraint in constraints),
+    ])
+
+
 def _build_prompt(body: ChatRequest) -> str:
-    return build_prompt(
+    tools = _chat_tools(body)
+    tool_choice = _chat_tool_choice(body)
+    prompt = build_prompt(
         [m.model_dump(exclude_none=True) for m in body.messages],
-        tools=body.tools if _tools_allowed(body.tools, body.tool_choice) else None,
-        tool_choice=body.tool_choice,
+        tools=tools if _tools_allowed(tools, tool_choice) else None,
+        tool_choice=tool_choice,
     )
+    return _append_response_constraints(prompt, _chat_response_constraints(body))
 
 
 def _estimate_tokens(text: str) -> int:
@@ -151,15 +265,36 @@ def _sse(payload: dict) -> str:
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
-def _chunk(req_id: str, model: str, content: str = "", finish_reason: str | None = None) -> str:
+def _chunk(
+    req_id: str,
+    model: str,
+    content: str = "",
+    finish_reason: str | None = None,
+    *,
+    include_usage: bool = False,
+) -> str:
     delta = {"content": content} if content else {}
-    return _chunk_delta(req_id, model, delta, finish_reason=finish_reason)
+    return _chunk_delta(req_id, model, delta, finish_reason=finish_reason, include_usage=include_usage)
 
 
-def _chunk_delta(req_id: str, model: str, delta: dict, finish_reason: str | None = None) -> str:
-    return _sse({"id": req_id, "object": "chat.completion.chunk",
-                 "created": int(time.time()), "model": model,
-                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]})
+def _chunk_delta(
+    req_id: str,
+    model: str,
+    delta: dict,
+    finish_reason: str | None = None,
+    *,
+    include_usage: bool = False,
+) -> str:
+    payload = {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    if include_usage:
+        payload["usage"] = None
+    return _sse(payload)
 
 
 def _tool_call_deltas(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -170,12 +305,102 @@ def _chat_messages(body: ChatRequest) -> list[dict[str, Any]]:
     return [m.model_dump(exclude_none=True) for m in body.messages]
 
 
+def _chat_stream_include_usage(body: ChatRequest) -> bool:
+    stream_options = body.stream_options if isinstance(body.stream_options, dict) else {}
+    return bool(stream_options.get("include_usage"))
+
+
+def _chat_stream_final_chunk(
+    req_id: str,
+    model: str,
+    finish_reason: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    include_usage: bool,
+) -> str:
+    payload = {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+    if include_usage:
+        payload["usage"] = None
+    return _sse(payload)
+
+
+def _chat_stream_usage_chunk(req_id: str, model: str, prompt_tokens: int, completion_tokens: int) -> str:
+    return _sse({
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": _usage(prompt_tokens, completion_tokens),
+    })
+
+
 def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+def _apply_stop_sequences(text: str, stop: list[str] | str | None) -> str:
+    if not stop:
+        return text
+    sequences = [stop] if isinstance(stop, str) else list(stop)
+    positions = [
+        position
+        for sequence in sequences
+        if isinstance(sequence, str) and sequence
+        for position in [text.find(sequence)]
+        if position >= 0
+    ]
+    if not positions:
+        return text
+    return text[:min(positions)]
+
+
+def _tool_call_to_legacy_function_call(tool_call: dict[str, Any]) -> dict[str, str]:
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    return {
+        "name": str(function.get("name", "")),
+        "arguments": str(function.get("arguments", "{}")),
+    }
+
+
+def _model_payload(model_info: dict[str, Any], created: int) -> dict[str, Any]:
+    return {
+        "id": model_info["id"],
+        "object": "model",
+        "created": created,
+        "owned_by": model_info.get("owned_by", "gitlab"),
+        "permission": [],
+        "root": model_info["id"],
+        "parent": None,
+        "name": model_info.get("name", model_info["id"]),
+        "gitlab_id": model_info.get("gitlab_id", model_info["id"]),
+        "model_provider": model_info.get("model_provider", model_info.get("owned_by", "gitlab")),
+        "cost_indicator": model_info.get("cost_indicator", ""),
+        "aliases": model_info.get("aliases", []),
+    }
+
+
+def _find_model_info(model_id: str, models: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for model_info in models:
+        identifiers = {
+            str(model_info.get("id", "")),
+            str(model_info.get("gitlab_id", "")),
+            *(str(alias) for alias in model_info.get("aliases", [])),
+        }
+        if model_id in identifiers:
+            return model_info
+    return None
 
 
 def _git_metadata(args: list[str], fallback_env: str) -> str:
@@ -213,9 +438,18 @@ def _local_status_payload(cfg: dict[str, Any]) -> dict[str, Any]:
         "features": {
             "chat_completions": True,
             "chat_tools": True,
+            "chat_legacy_functions": True,
+            "chat_legacy_function_call_response": True,
+            "chat_stream_usage": True,
+            "prompted_response_format": True,
+            "prompted_token_limits": True,
+            "chat_stop_non_stream": True,
             "responses_api": True,
+            "responses_non_stream": True,
+            "responses_text_sse_done_events": True,
             "codex_cli": True,
             "dynamic_models": True,
+            "single_model_endpoint": True,
             "duo_tool_bridge": ["create_file_with_contents", "run_command"],
             "unknown_duo_tool_diagnostics": True,
         },
@@ -559,24 +793,24 @@ async def list_models(request: Request):
     ts = int(time.time())
     return {
         "object": "list",
-        "data": [
-            {
-                "id": m["id"],
-                "object": "model",
-                "created": ts,
-                "owned_by": m.get("owned_by", "gitlab"),
-                "permission": [],
-                "root": m["id"],
-                "parent": None,
-                "name": m.get("name", m["id"]),
-                "gitlab_id": m.get("gitlab_id", m["id"]),
-                "model_provider": m.get("model_provider", m.get("owned_by", "gitlab")),
-                "cost_indicator": m.get("cost_indicator", ""),
-                "aliases": m.get("aliases", []),
-            }
-            for m in models
-        ],
+        "data": [_model_payload(m, ts) for m in models],
     }
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(request: Request, model_id: str):
+    if err := _check_auth(request):
+        return err
+    models = await get_available_models()
+    model_info = _find_model_info(model_id, models)
+    if model_info is None:
+        return _openai_error(
+            404,
+            "model_not_found",
+            f"Model '{model_id}' not found. Call /v1/models for available models.",
+            param="model",
+        )
+    return _model_payload(model_info, int(time.time()))
 
 
 @app.get("/healthz")
@@ -750,8 +984,10 @@ async def chat_completions(request: Request, body: ChatRequest):
     if err := _check_auth(request):
         return err
 
+    tools = _chat_tools(body)
+    tool_choice = _chat_tool_choice(body)
     try:
-        validate_tools(body.tools)
+        validate_tools(tools)
     except ValueError as e:
         return _openai_error(400, "invalid_request_error", str(e), param="tools")
 
@@ -773,7 +1009,8 @@ async def chat_completions(request: Request, body: ChatRequest):
     upstream_model = resolve_gitlab_model_id(model, models)
     prompt_tokens = _estimate_tokens(prompt)
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
-    tools_allowed = _tools_allowed(body.tools, body.tool_choice)
+    tools_allowed = _tools_allowed(tools, tool_choice)
+    legacy_functions = _chat_uses_legacy_functions(body)
     messages = _chat_messages(body)
 
     if body.stream:
@@ -786,8 +1023,10 @@ async def chat_completions(request: Request, body: ChatRequest):
                 upstream_model,
                 tools_enabled=tools_allowed,
                 messages=messages,
-                tools=body.tools,
-                tool_choice=body.tool_choice,
+                tools=tools,
+                tool_choice=tool_choice,
+                legacy_functions=legacy_functions,
+                include_usage=_chat_stream_include_usage(body),
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -801,8 +1040,10 @@ async def chat_completions(request: Request, body: ChatRequest):
         upstream_model,
         tools_enabled=tools_allowed,
         messages=messages,
-        tools=body.tools,
-        tool_choice=body.tool_choice,
+        tools=tools,
+        tool_choice=tool_choice,
+        legacy_functions=legacy_functions,
+        stop=body.stop,
     )
 
 
@@ -817,6 +1058,8 @@ async def _do_complete(
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    legacy_functions: bool = False,
+    stop: list[str] | str | None = None,
 ):
     session = DuoChat()
     try:
@@ -831,6 +1074,7 @@ async def _do_complete(
             )
         else:
             full = await session.send(prompt, model=upstream_model)
+            full = _apply_stop_sequences(full, stop)
             completion_tokens = _estimate_tokens(full)
             tool_calls = []
     except Exception as e:
@@ -840,6 +1084,15 @@ async def _do_complete(
         await session.close()
 
     if tool_calls:
+        if legacy_functions:
+            return JSONResponse(content={
+                "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                                                     "function_call": _tool_call_to_legacy_function_call(tool_calls[0])},
+                             "finish_reason": "function_call", "logprobs": None}],
+                "usage": _usage(prompt_tokens, completion_tokens),
+                "system_fingerprint": None,
+            })
         return JSONResponse(content={
             "id": req_id, "object": "chat.completion", "created": int(time.time()), "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
@@ -948,6 +1201,7 @@ async def _do_responses_stream(
 ):
     created_at = int(time.time())
     yield response_created_sse(resp_id, model, created_at)
+    yield response_in_progress_sse(resp_id, model, created_at)
 
     session = DuoChat()
     if tools_enabled:
@@ -986,25 +1240,7 @@ async def _do_responses_stream(
             repeated_text = response_text_for_repeated_completed_tool_call(tool_call, messages)
             if repeated_text:
                 message_id = f"msg_{uuid.uuid4().hex[:16]}"
-                added_item, done_item = text_output_items(message_id, repeated_text)
-                yield sse_event("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": 0,
-                    "item": added_item,
-                })
-                yield sse_event("response.output_text.delta", {
-                    "type": "response.output_text.delta",
-                    "item_id": message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": repeated_text,
-                })
-                yield sse_event("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": done_item,
-                })
-                yield response_completed_sse(resp_id, model, created_at, [done_item], usage)
+                yield response_text_output_sse(resp_id, model, created_at, message_id, repeated_text, usage)
                 return
             yield response_function_call_sse(
                 resp_id,
@@ -1016,25 +1252,7 @@ async def _do_responses_stream(
             return
 
         message_id = f"msg_{uuid.uuid4().hex[:16]}"
-        added_item, done_item = text_output_items(message_id, full)
-        yield sse_event("response.output_item.added", {
-            "type": "response.output_item.added",
-            "output_index": 0,
-            "item": added_item,
-        })
-        yield sse_event("response.output_text.delta", {
-            "type": "response.output_text.delta",
-            "item_id": message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "delta": full,
-        })
-        yield sse_event("response.output_item.done", {
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": done_item,
-        })
-        yield response_completed_sse(resp_id, model, created_at, [done_item], usage)
+        yield response_text_output_sse(resp_id, model, created_at, message_id, full, usage)
         return
 
     message_id = f"msg_{uuid.uuid4().hex[:16]}"
@@ -1125,12 +1343,17 @@ async def _do_stream(
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
+    legacy_functions: bool = False,
+    include_usage: bool = False,
 ):
     session = DuoChat()
 
-    yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+    yield _chunk_delta(
+        req_id,
+        model,
+        {"role": "assistant", "content": ""},
+        include_usage=include_usage,
+    )
 
     completion_tokens = 0
     if tools_enabled:
@@ -1152,26 +1375,62 @@ async def _do_stream(
             await session.close()
 
         if tool_calls:
-            yield _chunk_delta(req_id, model, {"tool_calls": _tool_call_deltas(tool_calls)})
-            yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                        "usage": _usage(prompt_tokens, completion_tokens)})
+            if legacy_functions:
+                yield _chunk_delta(
+                    req_id,
+                    model,
+                    {"function_call": _tool_call_to_legacy_function_call(tool_calls[0])},
+                    include_usage=include_usage,
+                )
+                yield _chat_stream_final_chunk(
+                    req_id,
+                    model,
+                    "function_call",
+                    prompt_tokens,
+                    completion_tokens,
+                    include_usage=include_usage,
+                )
+                if include_usage:
+                    yield _chat_stream_usage_chunk(req_id, model, prompt_tokens, completion_tokens)
+                yield "data: [DONE]\n\n"
+                return
+            yield _chunk_delta(
+                req_id,
+                model,
+                {"tool_calls": _tool_call_deltas(tool_calls)},
+                include_usage=include_usage,
+            )
+            yield _chat_stream_final_chunk(
+                req_id,
+                model,
+                "tool_calls",
+                prompt_tokens,
+                completion_tokens,
+                include_usage=include_usage,
+            )
+            if include_usage:
+                yield _chat_stream_usage_chunk(req_id, model, prompt_tokens, completion_tokens)
             yield "data: [DONE]\n\n"
             return
         if full:
-            yield _chunk(req_id, model, content=full)
-        yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": _usage(prompt_tokens, completion_tokens)})
+            yield _chunk(req_id, model, content=full, include_usage=include_usage)
+        yield _chat_stream_final_chunk(
+            req_id,
+            model,
+            "stop",
+            prompt_tokens,
+            completion_tokens,
+            include_usage=include_usage,
+        )
+        if include_usage:
+            yield _chat_stream_usage_chunk(req_id, model, prompt_tokens, completion_tokens)
         yield "data: [DONE]\n\n"
         return
 
     try:
         async for chunk in session.stream(prompt, model=upstream_model):
             completion_tokens += _estimate_tokens(chunk)
-            yield _chunk(req_id, model, content=chunk)
+            yield _chunk(req_id, model, content=chunk, include_usage=include_usage)
     except Exception as e:
         logger.warning("GitLab Duo upstream stream error: %s", e)
         yield _sse({"error": {"message": public_upstream_error_message(e), "type": "server_error", "code": "upstream_error"}})
@@ -1180,10 +1439,16 @@ async def _do_stream(
     finally:
         await session.close()
 
-    yield _sse({"id": req_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": _usage(prompt_tokens, completion_tokens)})
+    yield _chat_stream_final_chunk(
+        req_id,
+        model,
+        "stop",
+        prompt_tokens,
+        completion_tokens,
+        include_usage=include_usage,
+    )
+    if include_usage:
+        yield _chat_stream_usage_chunk(req_id, model, prompt_tokens, completion_tokens)
     yield "data: [DONE]\n\n"
 
 

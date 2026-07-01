@@ -400,14 +400,63 @@ def responses_body_to_messages(body: Mapping[str, Any]) -> list[dict[str, Any]]:
     return messages
 
 
+def _json_response_format_instruction(response_format: Mapping[str, Any] | None) -> str:
+    if not isinstance(response_format, Mapping):
+        return ""
+    format_type = str(response_format.get("type", "")).strip()
+    if format_type == "json_object":
+        return "Return only a valid JSON object. Do not wrap it in markdown."
+    if format_type == "json_schema":
+        schema = response_format.get("json_schema")
+        if not isinstance(schema, Mapping):
+            schema = response_format.get("schema")
+        if isinstance(schema, Mapping):
+            return (
+                "Return only JSON that conforms to this JSON schema. Do not wrap it in markdown:\n"
+                + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
+        return "Return only JSON that conforms to the requested JSON schema. Do not wrap it in markdown."
+    return ""
+
+
+def _responses_text_format(body: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    text = body.get("text")
+    if not isinstance(text, Mapping):
+        return None
+    text_format = text.get("format")
+    return text_format if isinstance(text_format, Mapping) else None
+
+
+def _responses_constraints(body: Mapping[str, Any]) -> list[str]:
+    constraints: list[str] = []
+    json_instruction = _json_response_format_instruction(_responses_text_format(body))
+    if json_instruction:
+        constraints.append(json_instruction)
+    token_limit = body.get("max_output_tokens")
+    if isinstance(token_limit, int) and token_limit > 0:
+        constraints.append(f"Keep the answer within approximately {token_limit} output tokens.")
+    return constraints
+
+
+def _append_response_constraints(prompt: str, constraints: Sequence[str]) -> str:
+    if not constraints:
+        return prompt
+    return "\n\n".join([
+        prompt,
+        "[Response Constraints]",
+        "\n".join(f"- {constraint}" for constraint in constraints),
+    ])
+
+
 def build_responses_prompt(body: Mapping[str, Any]) -> str:
     tool_choice = body.get("tool_choice")
     tools = None if tool_choice == "none" else body.get("tools")
-    return build_prompt(
+    prompt = build_prompt(
         responses_body_to_messages(body),
         tools=tools,
         tool_choice=tool_choice,
     )
+    return _append_response_constraints(prompt, _responses_constraints(body))
 
 
 def sse_event(event: str, data: Mapping[str, Any]) -> str:
@@ -417,6 +466,20 @@ def sse_event(event: str, data: Mapping[str, Any]) -> str:
 def response_created_sse(resp_id: str, model: str, created_at: int) -> str:
     return sse_event("response.created", {
         "type": "response.created",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+            "output": [],
+        },
+    })
+
+
+def response_in_progress_sse(resp_id: str, model: str, created_at: int) -> str:
+    return sse_event("response.in_progress", {
+        "type": "response.in_progress",
         "response": {
             "id": resp_id,
             "object": "response",
@@ -509,6 +572,59 @@ def response_completed_sse(
             "usage": dict(usage),
         },
     })
+
+
+def response_text_output_sse(
+    resp_id: str,
+    model: str,
+    created_at: int,
+    message_id: str,
+    text: str,
+    usage: Mapping[str, Any],
+) -> str:
+    added_item, done_item = text_output_items(message_id, text)
+    chunks = [
+        sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": added_item,
+        }),
+        sse_event("response.content_part.added", {
+            "type": "response.content_part.added",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+        }),
+        sse_event("response.output_text.delta", {
+            "type": "response.output_text.delta",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        }),
+        sse_event("response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        }),
+        sse_event("response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text},
+        }),
+        sse_event("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": done_item,
+        }),
+        response_completed_sse(resp_id, model, created_at, [done_item], usage),
+    ]
+    return "".join(chunks)
 
 
 def text_output_items(message_id: str, text: str) -> tuple[dict[str, Any], dict[str, Any]]:
